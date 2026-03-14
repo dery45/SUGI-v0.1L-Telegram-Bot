@@ -1,0 +1,95 @@
+# Python virtual environments
+venv/
+.env/
+env/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ChromaDB vector database (persist directory)
+chrome_longchain_db/
+chroma_db/
+chromadb/
+
+# Environment variables & secrets
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+*.env.backup
+
+# Python bytecode & cache files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Distribution / packaging
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.manifest
+*.spec
+
+# Logs & temporary files
+*.log
+*.logs
+*.tmp
+*.bak
+*.swp
+*~
+
+# Ollama & model-related (jika kamu simpan model lokal di repo – biasanya tidak)
+ollama/
+models/
+
+# macOS junk
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Windows junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Editor/IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Testing & coverage
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+*.coverage.*
+coverage/
+
+# Dependency management
+Pipfile.lock
+poetry.lock
+requirements.txt  # <-- optional: jika kamu ingin ignore requirements.txt (bisa di-generate ulang)
+
+# Misc project-specific
+*.DS_Store
+*.bak
+*.backup
+temp/
+tmp/

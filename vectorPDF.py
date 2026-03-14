@@ -1,0 +1,130 @@
+import hashlib
+import os
+import time
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from tqdm import tqdm
+from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+DB_PATH     = "chrome_longchain_db"
+DATASET_DIR = "pdfsource"
+EMBED_MODEL = "mxbai-embed-large"
+
+# ─── Initialization ─────────────────────────────────────────────────────────
+embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+vector_store = Chroma(
+    persist_directory=DB_PATH,
+    embedding_function=embeddings
+)
+
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=500,
+    chunk_overlap=50,
+    add_start_index=True
+)
+
+def normalize(text: str) -> str:
+    return " ".join(text.lower().strip().split())
+
+def index_file(file_path: str):
+    """Index a single PDF file into the vector store."""
+    file_name = os.path.basename(file_path)
+    if not file_name.lower().endswith(".pdf"):
+        return
+
+    existing = vector_store.get(where={"source": file_name}, limit=1)
+    if existing["ids"]:
+        print(f"⏭️  Already indexed: {file_name}")
+        return
+
+    print(f"📄 New PDF: {file_name}")
+    try:
+        loader = PyPDFLoader(file_path)
+        pages  = loader.load()
+        chunks = text_splitter.split_documents(pages)
+
+        documents = []
+        ids       = []
+        for chunk in chunks:
+            chunk.metadata["source"] = file_name
+            content      = normalize(chunk.page_content)
+            combined_str = (
+                f"{content}_{file_name}"
+                f"_{chunk.metadata.get('page', 0)}"
+                f"_{chunk.metadata.get('start_index', 0)}"
+            )
+            doc_id             = hashlib.md5(combined_str.encode()).hexdigest()
+            chunk.page_content = content
+            documents.append(chunk)
+            ids.append(doc_id)
+
+        if documents:
+            total      = len(documents)
+            batch_size = 10
+            print(f"📦 Indexing {file_name}: {total} chunks...")
+            for i in range(0, total, batch_size):
+                vector_store.add_documents(
+                    documents=documents[i:i+batch_size],
+                    ids=ids[i:i+batch_size]
+                )
+            print(f"✅ Indexed: {file_name}")
+
+    except Exception as e:
+        print(f"❌ Error processing {file_name}: {e}")
+
+def index_all_existing():
+    """Index any PDFs already present in the directory at startup."""
+    import glob
+    all_files = glob.glob(os.path.join(DATASET_DIR, "*.pdf"))
+    if not all_files:
+        return
+    for file_path in tqdm(all_files, desc="Initial PDF scan", leave=False):
+        index_file(file_path)
+
+
+# ─── Opt [5]: Watchdog event handler ────────────────────────────────────────
+class PDFHandler(FileSystemEventHandler):
+    def _handle(self, event):
+        if event.is_directory:
+            return
+        if event.src_path.lower().endswith(".pdf"):
+            print(f"\n🔔 PDF event: {os.path.basename(event.src_path)}")
+            time.sleep(0.5)   # wait for OS to finish writing
+            index_file(event.src_path)
+
+    def on_created(self, event):
+        self._handle(event)
+
+    def on_modified(self, event):
+        self._handle(event)
+
+
+# ─── Retriever (used by main.py when imported) ───────────────────────────────
+retriever = vector_store.as_retriever(
+    search_type="similarity_score_threshold",
+    search_kwargs={"k": 10, "score_threshold": 0.7}
+)
+
+# ─── Main Server ─────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    os.makedirs(DATASET_DIR, exist_ok=True)
+    print(f"🚀 PDF Vector Server started. Watching '{DATASET_DIR}/'...")
+
+    index_all_existing()
+
+    observer = Observer()
+    observer.schedule(PDFHandler(), path=DATASET_DIR, recursive=False)
+    observer.start()
+    print("👀 Watchdog active — waiting for new PDFs...\n")
+
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        observer.stop()
+        print("\n🛑 Server stopped.")
+    observer.join()
