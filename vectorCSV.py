@@ -1,3 +1,16 @@
+"""
+vectorCSV.py — CSV/XLSX indexer dengan chunk strategy per tipe data
+
+Perubahan dari versi sebelumnya:
+  - Chunk strategy berbeda per tipe file:
+      CSV tabular    → chunk_size=300,  overlap=30   (baris pendek, presisi tinggi)
+      XLSX sheet     → chunk_size=400,  overlap=50   (bisa lebih panjang per sel)
+      XLSX price     → chunk_size=200,  overlap=20   (data harga, mau exact match)
+      XLSX policy    → chunk_size=600,  overlap=80   (dokumen kebijakan, butuh konteks)
+  - Deteksi otomatis tipe sheet berdasarkan nama kolom
+  - Metadata diperkaya dengan detected_type untuk filtering di retriever
+"""
+
 import hashlib
 import os
 import pickle
@@ -12,31 +25,69 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-DB_PATH        = "chrome_longchain_db"
-DATASET_DIR    = "dataset"
-EMBED_MODEL    = "mxbai-embed-large"
+DB_PATH         = "chrome_longchain_db"
+DATASET_DIR     = "dataset"
+EMBED_MODEL     = "mxbai-embed-large"
 BM25_CACHE_PATH = "bm25_cache.pkl"
 
-# Fix [5]: Only 3 metadata fields per chunk instead of 20.
-# The actual data already lives in the chunk text — no need
-# to duplicate every column as a metadata key.
-METADATA_LIMIT = 20   # kept for backward compat but used minimally below
+# ─── Per-type chunk strategies ───────────────────────────────────────────────
+# Setiap strategi disesuaikan dengan karakteristik data:
+#   - Data tabular/harga: chunk kecil agar satu baris = satu chunk (presisi tinggi)
+#   - Data narasi/kebijakan: chunk besar agar konteks tidak terpotong
+CHUNK_STRATEGIES = {
+    "tabular":   {"chunk_size": 300,  "chunk_overlap": 30},
+    "price":     {"chunk_size": 200,  "chunk_overlap": 20},
+    "policy":    {"chunk_size": 600,  "chunk_overlap": 80},
+    "xlsx_default": {"chunk_size": 400, "chunk_overlap": 50},
+    "csv_default":  {"chunk_size": 300, "chunk_overlap": 30},
+}
+
+# Keyword deteksi tipe data berdasarkan nama kolom (lowercase)
+_PRICE_COLS    = {"harga", "price", "nilai", "cost", "tarif", "rate", "rupiah", "rp", "usd"}
+_POLICY_COLS   = {"kebijakan", "regulasi", "peraturan", "policy", "aturan", "ketentuan",
+                  "pasal", "ayat", "keputusan", "permentan", "sk", "instruksi"}
+_TABULAR_COLS  = {"tanggal", "date", "provinsi", "kabupaten", "kecamatan", "kode",
+                  "id", "no", "nomor", "komoditas", "varietas", "musim", "panen"}
+
+
+def _detect_sheet_type(df: pd.DataFrame) -> str:
+    """
+    Deteksi tipe data berdasarkan nama kolom.
+    Return salah satu dari: price, policy, tabular, xlsx_default.
+    """
+    cols = {c.lower().strip() for c in df.columns}
+
+    # Cek overlap dengan keyword sets
+    if cols & _PRICE_COLS:
+        return "price"
+    if cols & _POLICY_COLS:
+        return "policy"
+    if cols & _TABULAR_COLS:
+        return "tabular"
+    return "xlsx_default"
+
+
+def _get_splitter(data_type: str) -> RecursiveCharacterTextSplitter:
+    """Buat splitter sesuai tipe data."""
+    cfg = CHUNK_STRATEGIES.get(data_type, CHUNK_STRATEGIES["csv_default"])
+    return RecursiveCharacterTextSplitter(
+        chunk_size=cfg["chunk_size"],
+        chunk_overlap=cfg["chunk_overlap"],
+        add_start_index=True,
+    )
+
 
 # ─── Initialization ─────────────────────────────────────────────────────────
-embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+embeddings   = OllamaEmbeddings(model=EMBED_MODEL)
 vector_store = Chroma(
     persist_directory=DB_PATH,
     embedding_function=embeddings
 )
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    add_start_index=True
-)
 
 def normalize(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
 
 def read_csv_safe(file_path):
     for enc in ["utf-8", "latin-1", "cp1252"]:
@@ -45,6 +96,7 @@ def read_csv_safe(file_path):
         except (UnicodeDecodeError, Exception):
             continue
     return None
+
 
 def read_xlsx_safe(file_path):
     try:
@@ -56,22 +108,43 @@ def read_xlsx_safe(file_path):
                 if not df.empty:
                     sheets[sheet_name] = df
             except Exception as e:
-                print(f"  ⚠️ Skipping sheet '{sheet_name}': {e}")
+                print(f"  ⚠️  Skipping sheet '{sheet_name}': {e}")
         return sheets if sheets else None
     except Exception as e:
         print(f"  ❌ Failed to open XLSX: {e}")
         return None
 
-def process_dataframe(df, file_name, sheet_name=None):
+
+def process_dataframe(df, file_name, sheet_name=None, forced_type=None):
+    """
+    Proses satu DataFrame menjadi list (Document, doc_id).
+
+    Args:
+        forced_type: override deteksi otomatis (untuk CSV yang tipenya sudah jelas)
+    """
     results      = []
     source_label = f"{file_name} (sheet: {sheet_name})" if sheet_name else file_name
+
+    # Deteksi tipe data
+    if forced_type:
+        data_type = forced_type
+    elif sheet_name:
+        data_type = _detect_sheet_type(df)
+    else:
+        # CSV: deteksi dari kolom, fallback ke csv_default
+        detected = _detect_sheet_type(df)
+        data_type = detected if detected != "xlsx_default" else "csv_default"
+
+    text_splitter = _get_splitter(data_type)
+    cfg           = CHUNK_STRATEGIES.get(data_type, CHUNK_STRATEGIES["csv_default"])
+
+    print(f"   📐 [{data_type}] chunk_size={cfg['chunk_size']} overlap={cfg['chunk_overlap']}")
 
     for i, row in df.iterrows():
         row_dict = row.dropna().to_dict()
         if not row_dict:
             continue
 
-        # Build the full text content — all data goes here
         content_parts = [f"Source: {source_label}"]
         if sheet_name:
             content_parts.append(f"Sheet: {sheet_name}")
@@ -79,12 +152,10 @@ def process_dataframe(df, file_name, sheet_name=None):
             content_parts.append(f"{k}: {v}")
         full_content = "\n".join(content_parts)
 
-        # Fix [5]: Minimal metadata — only what's needed for filtering.
-        # All field values are already present in the chunk text above,
-        # so storing them again as metadata just bloats ChromaDB.
         base_metadata = {
-            "source":  file_name,
-            "row_id":  str(i),
+            "source":        file_name,
+            "row_id":        str(i),
+            "data_type":     data_type,         # ← baru: untuk filtering
             **({"sheet": sheet_name} if sheet_name else {}),
         }
 
@@ -96,18 +167,20 @@ def process_dataframe(df, file_name, sheet_name=None):
             metadata     = {**base_metadata, "chunk_index": chunk_idx}
             results.append((
                 Document(page_content=content, metadata=metadata, id=doc_id),
-                doc_id
+                doc_id,
             ))
+
     return results
 
+
 def invalidate_bm25_cache():
-    """Delete the BM25 pickle so main.py rebuilds it on next startup."""
     if os.path.exists(BM25_CACHE_PATH):
         os.remove(BM25_CACHE_PATH)
         print("🗑️  BM25 cache invalidated — will rebuild on next main.py start.")
 
+
 def index_file(file_path: str):
-    """Index a single CSV or XLSX file. Invalidates BM25 cache on success."""
+    """Index satu file CSV atau XLSX."""
     file_name = os.path.basename(file_path)
     ext       = os.path.splitext(file_name)[1].lower()
     documents = []
@@ -121,6 +194,7 @@ def index_file(file_path: str):
             return
         df = read_csv_safe(file_path)
         if df is not None:
+            print(f"📄 Indexing CSV: {file_name} ({len(df)} rows)")
             for doc, doc_id in process_dataframe(df, file_name):
                 documents.append(doc)
                 ids.append(doc_id)
@@ -135,7 +209,7 @@ def index_file(file_path: str):
             )
             if existing["ids"]:
                 continue
-            print(f"📄 New sheet: {file_name} → {sheet_name}")
+            print(f"📄 New sheet: {file_name} → {sheet_name} ({len(df)} rows)")
             for doc, doc_id in process_dataframe(df, file_name, sheet_name=sheet_name):
                 documents.append(doc)
                 ids.append(doc_id)
@@ -149,13 +223,14 @@ def index_file(file_path: str):
         for i in tqdm(range(0, total, batch_size), desc="Indexing", leave=False):
             vector_store.add_documents(
                 documents=documents[i:i+batch_size],
-                ids=ids[i:i+batch_size]
+                ids=ids[i:i+batch_size],
             )
         print(f"✅ Indexed: {file_name}")
         indexed = True
 
     if indexed:
         invalidate_bm25_cache()
+
 
 def index_all_existing():
     import glob
@@ -166,14 +241,11 @@ def index_all_existing():
     if not all_files:
         print(f"⚠️  No files found in {DATASET_DIR}/")
         return
-    newly_indexed = False
     for file_path in tqdm(all_files, desc="Initial scan", leave=False):
-        before = len(vector_store.get(limit=1)["ids"])
         index_file(file_path)
-        # invalidate_bm25_cache already called inside index_file if needed
 
 
-# ─── Watchdog handler ────────────────────────────────────────────────────────
+# ─── Watchdog ────────────────────────────────────────────────────────────────
 class DatasetHandler(FileSystemEventHandler):
     def _handle(self, event):
         if event.is_directory:
@@ -191,13 +263,14 @@ class DatasetHandler(FileSystemEventHandler):
 # ─── Retriever ───────────────────────────────────────────────────────────────
 retriever = vector_store.as_retriever(
     search_type="similarity_score_threshold",
-    search_kwargs={"k": 10, "score_threshold": 0.7}
+    search_kwargs={"k": 10, "score_threshold": 0.7},
 )
 
 # ─── Main Server ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     os.makedirs(DATASET_DIR, exist_ok=True)
     print(f"🚀 CSV/XLSX Vector Server started. Watching '{DATASET_DIR}/'...")
+    print(f"📐 Chunk strategies active: {list(CHUNK_STRATEGIES.keys())}")
 
     index_all_existing()
 
