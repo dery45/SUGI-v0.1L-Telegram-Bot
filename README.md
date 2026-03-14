@@ -93,19 +93,6 @@ sugi-v0.1L/
 └── requirements.txt
 ```
 
-## Cara Kontribusi
-
-1. Fork repo ini  
-2. Buat branch `feature/nama-fitur`  
-3. Commit & push  
-4. Buat Pull Request dengan deskripsi jelas  
-
-Kami sangat terbuka untuk:  
-- Integrasi harga komoditas real-time  
-- UI web (Streamlit/Gradio)  
-- Dukungan bahasa daerah (Jawa/Sunda)  
-- Tambah sumber data (satelit NDVI, BMKG API, dll.)
-
 ## Lisensi
 
 MIT License – bebas digunakan, dimodifikasi, dan dikembangkan lebih lanjut.  
