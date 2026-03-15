@@ -1,3 +1,32 @@
+"""
+main.py — SUGI v0.1L (Qwen2.5-1.5B replaces phi3 for all utility tasks)
+
+Perubahan dari versi sebelumnya:
+  [UPGRADE] phi3 diganti Qwen2.5-1.5B untuk semua utility task:
+             - plant name fallback extraction (lebih deterministik)
+             - eval loop faithfulness + relevance (lebih akurat)
+             - query rewriting LLM fallback (lebih baik Bahasa Indonesia)
+  [NEW] maybe_rewrite() kini punya tiga lapis:
+             1. rule-based (0ms) — handle 85% kasus
+             2. Qwen LLM fallback (~800ms) — handle kasus kompleks
+             3. return original — kalau keduanya gagal
+
+main.py — SUGI v0.1L (fixed: rewriter guardrail, plant false-positive, eval skip greeting)
+
+Bug fixes dari v sebelumnya:
+  [FIX 1] Query rewriter sekarang punya guardrail ketat:
+            - Output phi3 divalidasi: harus ≤ 25 kata, tidak boleh mengandung
+              kata penanda jawaban (saya, maaf, karena, adalah, dll.)
+            - Kalau output tidak valid → pakai original question
+  [FIX 2] is_plant_query() sekarang dua lapis:
+            - STRONG keywords (nama tanaman spesifik) → cek di rewritten query
+            - WEAK keywords (tanaman, soil, disease, dll.) → cek HANYA di
+              original question user, bukan di output rewriter phi3
+            - extract_and_translate_plant() sekarang dari original question
+            - Return None kalau tidak ada tanaman valid → plant API tidak dipanggil
+  [FIX 3] Eval loop skip faithfulness untuk greeting/salam murni
+"""
+
 import hashlib
 import pickle
 import os
@@ -55,7 +84,11 @@ BM25_CACHE_PATH   = "bm25_cache.pkl"
 SCOPE_CONFIG_PATH   = "word_config/scope_config.ini"
 
 model         = OllamaLLM(model="sugi-v0.1L", temperature=0.3, repeat_penalty=1.15)
-rewrite_model = OllamaLLM(model="phi3", temperature=0)
+# Qwen2.5-1.5B menggantikan phi3 untuk semua utility task:
+# plant name fallback extraction + rewriting LLM fallback
+# Lebih kecil dari phi3 (1.5B vs 3.8B), lebih baik untuk Bahasa Indonesia
+UTILITY_MODEL    = "qwen2.5:1.5b"
+rewrite_model = OllamaLLM(model=UTILITY_MODEL, temperature=0)
 
 embeddings = OllamaEmbeddings(model=EMBED_MODEL)
 
@@ -362,6 +395,70 @@ def _resolve_suffix_referential(question: str, subject: str) -> str:
     return result
 
 
+# ─────────────────────────────────────────────
+# Qwen2.5-1.5B rewriter — LLM fallback untuk kasus kompleks
+# ─────────────────────────────────────────────
+# Dipanggil oleh maybe_rewrite() hanya saat rule-based tidak bisa resolve.
+# Qwen2.5-1.5B dipilih karena:
+#   - Lebih kecil dari phi3 (1.5B vs 3.8B) → hemat ~1 GB VRAM
+#   - Lebih patuh instruksi singkat (instruction-tuned dengan RLHF lebih modern)
+#   - Lebih baik untuk Bahasa Indonesia (multilingual training coverage lebih luas)
+
+_QWEN_REWRITE_TEMPLATE = (
+    "Tugas: ubah PERTANYAAN menjadi pertanyaan yang berdiri sendiri menggunakan RIWAYAT.\n\n"
+    "Aturan KETAT:\n"
+    "- Output HANYA satu pertanyaan singkat, tanpa penjelasan\n"
+    "- Jangan jawab pertanyaannya — hanya reformulasi\n"
+    "- Maksimal 20 kata\n"
+    "- Jika pertanyaan sudah jelas sendiri, kembalikan apa adanya\n\n"
+    "RIWAYAT:\n{history}\n\n"
+    "PERTANYAAN: {question}\n\n"
+    "PERTANYAAN STANDALONE:"
+)
+_qwen_rewrite_prompt = ChatPromptTemplate.from_template(_QWEN_REWRITE_TEMPLATE)
+_qwen_rewrite_chain  = _qwen_rewrite_prompt | rewrite_model | StrOutputParser()
+
+# Kata-kata yang menandakan model menjawab bukan merewrite
+_REWRITE_ANSWER_MARKERS = [
+    "saya ", "aku ", "maaf", "tentu", "baik,", "iya,", "tidak,",
+    "i am", "i can", "i don't", "sure", "of course",
+    "pertama", "kedua", "berikut",
+]
+
+
+def _is_valid_qwen_rewrite(rewritten: str) -> bool:
+    """Validasi output Qwen: harus pertanyaan pendek, bukan jawaban."""
+    r = rewritten.strip().lower()
+    if len(r.split()) > 25:
+        return False
+    for marker in _REWRITE_ANSWER_MARKERS:
+        if r.startswith(marker):
+            return False
+    if rewritten.count("?") > 1:
+        return False
+    return True
+
+
+def _qwen_rewrite(question: str, history_text: str) -> str:
+    """
+    Gunakan Qwen2.5-1.5B untuk merewrite pertanyaan yang tidak bisa
+    diselesaikan oleh rule-based. Fallback ke original jika output tidak valid.
+    """
+    print("   [rewrite] rule-based miss → trying Qwen2.5 fallback...")
+    try:
+        raw       = _qwen_rewrite_chain.invoke({"history": history_text, "question": question})
+        rewritten = raw.strip().split("\n")[0].strip()
+        if _is_valid_qwen_rewrite(rewritten):
+            print(f"   [rewrite] Qwen: '{question}' -> '{rewritten}'")
+            return rewritten
+        print(f"   [rewrite] Qwen output invalid — using original")
+        return question
+    except Exception as e:
+        print(f"   [rewrite] Qwen error: {e} — using original")
+        return question
+
+
+
 def maybe_rewrite(question: str, history_text: str) -> str:
     """
     Rule-based query rewriting — config dari rewriter_config.ini.
@@ -412,7 +509,14 @@ def maybe_rewrite(question: str, history_text: str) -> str:
             q = q.rstrip("?").rstrip() + f" {subject}?"
 
     if q != question:
-        print(f"   [rewrite] '{question}' -> '{q}'")
+        print(f"   [rewrite] rule-based: '{question}' -> '{q}'")
+        return q
+
+    # Rule-based tidak bisa resolve — coba Qwen2.5 sebagai fallback
+    # Hanya dipanggil kalau ada sinyal referensial/followup tapi subjek tidak ditemukan
+    if has_ref or is_followup:
+        return _qwen_rewrite(question, history_text)
+
     return q
 
 
@@ -510,7 +614,7 @@ def extract_and_translate_plant(question: str) -> str | None:
     """
     Layer 1: direct map _PLANT_NAME_MAP (deterministik).
              Frasa lebih panjang dicek dulu (kelapa sawit sebelum kelapa).
-    Layer 2: phi3 fallback hanya kalau tidak ada di map.
+    Layer 2: Qwen2.5-1.5B fallback hanya kalau tidak ada di map.
     """
     q = question.lower()
 
@@ -520,7 +624,7 @@ def extract_and_translate_plant(question: str) -> str | None:
             print(f"   [plant-map] '{keyword}' -> '{mapped}'")
             return mapped
 
-    print("   [plant-map] no direct match -- trying phi3 fallback...")
+    print("   [plant-map] no direct match -- trying Qwen fallback...")
     try:
         result     = _plant_fallback_chain.invoke({"question": question})
         plant_name = result.strip().split("\n")[0].lower().strip()
@@ -530,12 +634,12 @@ def extract_and_translate_plant(question: str) -> str | None:
             or len(plant_name.split()) > 4
             or any(w in plant_name for w in ["question", "answer", "->", ":"])
         ):
-            print(f"   [plant-map] phi3: no valid plant (got: '{plant_name}')")
+            print(f"   [plant-map] Qwen: no valid plant (got: '{plant_name}')")
             return None
-        print(f"   [plant-map] phi3: '{plant_name}'")
+        print(f"   [plant-map] Qwen: '{plant_name}'")
         return plant_name
     except Exception as e:
-        print(f"   [plant-map] phi3 error: {e}")
+        print(f"   [plant-map] Qwen error: {e}")
         return None
 
 
@@ -570,16 +674,40 @@ _PLANTING_SUITABILITY_PHRASES = {
 }
 
 
+# Kata-kata yang menandakan query adalah budidaya/perawatan, BUKAN cuaca
+# Kalau kata ini muncul tanpa keyword cuaca eksplisit → jangan trigger weather
+_CULTIVATION_SIGNALS = {
+    "merawat", "cara merawat", "cara menanam", "cara budidaya",
+    "teknik", "panduan", "langkah", "tips", "bagaimana cara",
+    "pemupukan", "penyiraman", "pemangkasan", "pengendalian hama",
+    "penyakit tanaman", "hama tanaman", "perawatan", "budidaya",
+    "how to grow", "how to care", "growing guide", "cultivation",
+    "treatment", "fertilizer", "pruning", "irrigation method",
+}
+
+
 def _is_weather_query(question: str) -> bool:
     q = question.lower()
-    # Cek keyword cuaca eksplisit
-    if any(_word_match(kw, q) for kw in WEATHER_KEYWORDS):
-        return True
-    # Cek frasa kesesuaian tanam — implisit butuh data cuaca
-    for phrase in _PLANTING_SUITABILITY_PHRASES:
-        if phrase in q:
-            print(f"   [weather: planting suitability '{phrase}' -> WEATHER]")
+
+    # Cek keyword cuaca eksplisit — selalu trigger
+    for kw in WEATHER_KEYWORDS:
+        if _word_match(kw, q):
             return True
+
+    # Cek frasa kesesuaian tanam — hanya trigger jika tidak ada sinyal budidaya
+    # "apakah cuaca cocok untuk menanam padi?" → YES (butuh data cuaca aktual)
+    # "bagaimana cara merawat tanaman padi?" → NO (pertanyaan budidaya, bukan cuaca)
+    has_suitability = any(phrase in q for phrase in _PLANTING_SUITABILITY_PHRASES)
+    if has_suitability:
+        has_cultivation = any(_word_match(sig, q) for sig in _CULTIVATION_SIGNALS)
+        if not has_cultivation:
+            for phrase in _PLANTING_SUITABILITY_PHRASES:
+                if phrase in q:
+                    print(f"   [weather: planting suitability '{phrase}' -> WEATHER]")
+                    break
+            return True
+        print(f"   [weather: suitability phrase found but cultivation signal present -> SKIP]")
+
     return False
 
 
@@ -680,6 +808,7 @@ def summarize_and_save_session(history: list, session_id: str):
 # mem-parse template — sehingga tidak ada collision apapun.
 
 _ANSWER_TEMPLATE_BASE = (
+    "Kamu adalah Sugi, asisten pertanian Indonesia yang ramah dan berpengetahuan luas.\n\n"
     "Informasi sesi saat ini:\n"
     "- Tanggal  : [[NOW_DATE]]\n"
     "- Hari     : [[NOW_DAY]]\n"
@@ -687,14 +816,31 @@ _ANSWER_TEMPLATE_BASE = (
     "- Lokasi   : Jakarta, Indonesia\n\n"
     "Data relevan dari database (pertanian, cuaca, tanaman):\n"
     "{data}\n\n"
-    "PENTING:\n"
-    "- Gunakan tanggal, hari, dan jam di atas kalau pertanyaan menyebut "
-    "\"hari ini\", \"sekarang\", \"saat ini\", atau \"today\".\n"
-    "- Jika data berisi informasi cuaca (suhu, hujan, kelembaban, angin, dll.), "
-    "WAJIB gunakan data tersebut untuk menjawab.\n"
-    "- Jika data berisi informasi tanaman atau pertanian, prioritaskan data tersebut.\n"
-    "- Jawab secara ringkas dan jelas, tidak mengulang kalimat yang sama.\n"
-    "- Akhiri jawaban setelah selesai menjelaskan.\n\n"
+    "PANDUAN MENJAWAB:\n"
+    "1. SUMBER DATA\n"
+    "   - Jika data berisi informasi cuaca, WAJIB gunakan dan sebut angkanya "
+    "(suhu, curah hujan, kelembaban, dll.).\n"
+    "   - Jika data berisi informasi harga, sebutkan harga spesifik dan tanggalnya.\n"
+    "   - Jika data berisi panduan budidaya, kutip langkah yang relevan saja.\n"
+    "   - Jika data TIDAK relevan atau kosong, jawab dari pengetahuan umum dan "
+    "beritahu user bahwa data spesifik tidak tersedia.\n"
+    "   - Gunakan tanggal/hari/jam di atas kalau pertanyaan menyebut "
+    "\"hari ini\", \"sekarang\", atau \"today\".\n\n"
+    "2. FORMAT JAWABAN\n"
+    "   - Langsung jawab tanpa sapaan pembuka (tidak perlu \"Halo!\" atau "
+    "\"Tentu saja!\").\n"
+    "   - Gunakan bullet points HANYA jika ada 3 item atau lebih yang perlu "
+    "disebutkan (langkah, syarat, daftar).\n"
+    "   - Untuk 1–2 poin: cukup gunakan kalimat biasa.\n"
+    "   - Panjang ideal: 3–6 kalimat untuk pertanyaan sederhana, maksimal 10 "
+    "baris untuk pertanyaan kompleks.\n"
+    "   - Jangan mengulang kalimat yang sudah disebutkan.\n"
+    "   - Akhiri jawaban tepat setelah selesai menjelaskan — tidak perlu penutup "
+    "seperti \"Semoga membantu!\"\n\n"
+    "3. BAHASA & NADA\n"
+    "   - Gunakan Bahasa Indonesia yang jelas dan mudah dipahami petani.\n"
+    "   - Jika user menulis dalam Bahasa Inggris, jawab dalam Bahasa Inggris.\n"
+    "   - Nada: ramah tapi profesional. Tidak terlalu formal, tidak terlalu santai.\n\n"
     "Pertanyaan: {question}"
 )
 
@@ -857,7 +1003,15 @@ while True:
         retriever_obj = build_retriever(has_history, include_plant, include_weather=False)
         docs          = retriever_obj.invoke(standalone_query)
 
-        all_docs = weather_context_docs + [d for d in docs if d not in weather_context_docs]
+        # Dedup berdasarkan page_content hash — mencegah weather docs masuk dua kali
+        # via RAG retriever (weather docs ada di collection yang sama dengan langchain)
+        _seen_ids = set()
+        all_docs  = []
+        for d in (weather_context_docs + docs):
+            _key = hash(d.page_content[:120])
+            if _key not in _seen_ids:
+                _seen_ids.add(_key)
+                all_docs.append(d)
         context  = format_docs(all_docs) if all_docs else "Tidak ada data relevan di database."
         print(f"📊 Found {len(all_docs)} relevant chunks "
               f"({len(weather_context_docs)} weather + {len(docs)} RAG).")

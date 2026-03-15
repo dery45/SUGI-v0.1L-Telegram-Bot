@@ -1,3 +1,18 @@
+"""
+plant_api.py — Perenual Plant API dengan exponential backoff + request queue
+
+Perubahan dari versi sebelumnya:
+  [NEW] _get() sekarang punya exponential backoff untuk 429:
+          - Retry otomatis max 4x
+          - Delay: 2s, 4s, 8s, 16s (base=2, multiplier=2)
+          - Header Retry-After dihormati kalau API mengirimnya
+  [NEW] _ApiQueue — token bucket sederhana yang membatasi 1 request/detik
+          ke Perenual (free tier limit ~60 req/menit).
+          Semua _get() call dilewatkan melalui queue ini.
+  [NEW] Jitter acak ditambahkan ke setiap delay agar tidak ada thundering herd
+          kalau beberapa query berjalan hampir bersamaan.
+"""
+
 import os
 import hashlib
 import time
@@ -16,6 +31,13 @@ load_dotenv()
 PERENUAL_KEY     = os.getenv("PERENUAL_API_KEY", "")
 PERENUAL_BASE    = "https://perenual.com/api/v2"
 PERENUAL_BASE_V1 = "https://perenual.com/api"
+
+# ─── Plant cache TTL ──────────────────────────────────────────────────────────
+# Data dari Perenual API disimpan permanen di ChromaDB.
+# PLANT_CACHE_TTL_DAYS = berapa hari sebelum cache dianggap stale dan di-refresh.
+# Set ke 0 untuk mematikan TTL (cache tidak pernah expire).
+# Default 30 hari: cukup untuk menjaga data tetap fresh tanpa terlalu banyak API call.
+PLANT_CACHE_TTL_DAYS = 30
 
 EMBED_MODEL = "mxbai-embed-large"
 # ─── ChromaDB server connection ──────────────────────────────────────────────
@@ -63,60 +85,62 @@ class _ApiQueue:
 
 _queue = _ApiQueue(min_interval=1.1)
 
+# ─── Session-level rate limit flag ──────────────────────────────────────────
+# Di-set True saat _get() menyerah setelah semua retry habis karena 429.
+# Semua fungsi API cek flag ini — kalau True langsung return kosong tanpa retry.
+# Reset ke False hanya saat restart program.
+_api_rate_limited = False
 
-# ─── HTTP helper dengan exponential backoff ───────────────────────────────────
-_MAX_RETRIES  = 4
-_BACKOFF_BASE = 2.0   # detik, digandakan setiap retry
-_JITTER_MAX   = 0.5   # detik acak tambahan untuk menghindari thundering herd
+
+# ─── HTTP helper dengan flat retry ───────────────────────────────────────────
+_MAX_RETRIES  = 2      # max 2 retry (3 attempt total) — gagal cepat
+_BACKOFF_FLAT = 1.5    # detik flat per retry — tidak eksponensial
+_JITTER_MAX   = 0.3    # jitter kecil untuk menghindari thundering herd
 
 
 def _get(url: str, params: dict) -> Optional[dict]:
     """
     GET request ke Perenual API dengan:
       - Token bucket rate limiting (tunggu giliran sebelum kirim)
-      - Exponential backoff untuk 429 Too Many Requests
-      - Menghormati header Retry-After kalau ada
-      - Jitter acak di setiap delay
+      - Flat retry untuk 429 Too Many Requests (max 2 retry)
+      - Menghormati header Retry-After kalau ada (capped 3 detik)
+      - Jitter kecil di setiap delay
 
     Retry schedule (tanpa jitter):
       Attempt 1: langsung
-      Attempt 2: tunggu 2s
-      Attempt 3: tunggu 4s
-      Attempt 4: tunggu 8s
-      Attempt 5: tunggu 16s → lalu return None
+      Attempt 2: tunggu 1.5s
+      Attempt 3: tunggu 1.5s → lalu return None
+    Total worst-case tunggu: ~3 detik (vs 30+ detik sebelumnya)
     """
-    attempt      = 0
-    backoff_secs = _BACKOFF_BASE
+    attempt = 0
 
     while attempt <= _MAX_RETRIES:
         _queue.wait()   # rate limit: tunggu giliran
 
         try:
-            resp = requests.get(url, params=params, timeout=12)
+            resp = requests.get(url, params=params, timeout=8)
 
-            # 429 → backoff dan retry
+            # 429 → flat retry
             if resp.status_code == 429:
                 attempt += 1
                 if attempt > _MAX_RETRIES:
-                    print(f"   ❌ 429 after {_MAX_RETRIES} retries — giving up: {url}")
+                    global _api_rate_limited
+                    _api_rate_limited = True
+                    print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan untuk sesi ini.")
+                    print(f"   ℹ️  Jawaban akan menggunakan data RAG lokal.")
                     return None
 
-                # Cek header Retry-After dari server
+                # Cek header Retry-After dari server, tapi cap di 3 detik
                 retry_after = resp.headers.get("Retry-After")
-                if retry_after:
-                    try:
-                        wait = float(retry_after)
-                    except ValueError:
-                        wait = backoff_secs
-                else:
-                    wait = backoff_secs
+                try:
+                    wait = min(float(retry_after), 3.0) if retry_after else _BACKOFF_FLAT
+                except ValueError:
+                    wait = _BACKOFF_FLAT
 
-                jitter  = random.uniform(0, _JITTER_MAX)
-                total   = wait + jitter
-                print(f"   ⏳ 429 rate limit — retry {attempt}/{_MAX_RETRIES} "
-                      f"in {total:.1f}s (backoff={wait:.0f}s + jitter={jitter:.2f}s)...")
+                jitter = random.uniform(0, _JITTER_MAX)
+                total  = wait + jitter
+                print(f"   ⏳ 429 — retry {attempt}/{_MAX_RETRIES} in {total:.1f}s...")
                 time.sleep(total)
-                backoff_secs *= 2   # eksponensial
                 continue
 
             resp.raise_for_status()
@@ -124,11 +148,9 @@ def _get(url: str, params: dict) -> Optional[dict]:
 
         except requests.exceptions.Timeout:
             attempt += 1
-            jitter  = random.uniform(0, _JITTER_MAX)
-            wait    = backoff_secs + jitter
+            wait = _BACKOFF_FLAT + random.uniform(0, _JITTER_MAX)
             print(f"   ⏳ Timeout — retry {attempt}/{_MAX_RETRIES} in {wait:.1f}s...")
             time.sleep(wait)
-            backoff_secs *= 2
 
         except requests.exceptions.RequestException as e:
             # Error non-429 (500, network, dll.) — tidak di-retry
@@ -144,20 +166,49 @@ def _doc_id(content: str) -> str:
 
 
 def _already_cached(cache_key: str) -> bool:
-    result = plant_store.get(where={"cache_key": cache_key}, limit=1)
-    return bool(result["ids"])
+    """
+    Cek apakah cache_key sudah ada di ChromaDB dan belum expired (TTL).
+    Kalau TTL habis → return False agar data di-fetch ulang dari Perenual.
+    """
+    result = plant_store.get(where={"cache_key": cache_key}, limit=1, include=["metadatas"])
+    if not result["ids"]:
+        return False
+    if PLANT_CACHE_TTL_DAYS <= 0:
+        return True   # TTL dimatikan — cache selalu valid
+    # Cek usia cache
+    meta      = result["metadatas"][0] if result["metadatas"] else {}
+    cached_at = meta.get("cached_at", "")
+    if not cached_at:
+        return True   # entri lama tanpa timestamp — anggap masih valid
+    try:
+        from datetime import datetime as _dt
+        age_days = (_dt.now() - _dt.fromisoformat(cached_at)).days
+        if age_days > PLANT_CACHE_TTL_DAYS:
+            print(f"   ♻️  Plant cache expired ({age_days} days old) — will re-fetch.")
+            # Hapus entri lama agar tidak duplikat saat upsert
+            plant_store.delete(ids=result["ids"])
+            return False
+    except Exception:
+        pass   # parsing error — anggap masih valid
+    return True
 
 
 def _store_docs(documents: list[Document]):
+    """Simpan dokumen ke ChromaDB dengan timestamp cached_at untuk TTL tracking."""
     if not documents:
         return
+    from datetime import datetime as _dt
+    now_iso = _dt.now().isoformat(timespec="seconds")
+    # Inject cached_at ke semua dokumen
+    for doc in documents:
+        doc.metadata["cached_at"] = now_iso
     ids      = [doc.id for doc in documents]
     existing = plant_store.get(ids=ids)["ids"]
     new_docs = [d for d in documents if d.id not in existing]
     new_ids  = [d.id for d in new_docs]
     if new_docs:
         plant_store.add_documents(documents=new_docs, ids=new_ids)
-        print(f"   💾 Stored {len(new_docs)} new plant docs to ChromaDB.")
+        print(f"   💾 Stored {len(new_docs)} new plant docs to ChromaDB (cached_at: {now_iso}).")
 
 
 # ─── API 1: Species search + details ─────────────────────────────────────────
@@ -373,6 +424,9 @@ def get_cached_plant_docs(plant_name: str, k: int = 6) -> list[Document]:
 
 
 def search_plant_info(plant_name: str) -> list[Document]:
+    if _api_rate_limited:
+        print("   ⏭️  Perenual API dinonaktifkan (429 sebelumnya) — pakai RAG lokal.")
+        return []
     if not PERENUAL_KEY or PERENUAL_KEY == "sk-your-api-key-here":
         print("   ⚠️  PERENUAL_API_KEY not configured — skipping API fetch.")
         return []

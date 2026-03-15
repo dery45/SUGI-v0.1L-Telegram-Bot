@@ -14,6 +14,7 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 
 - **RAG Hybrid** → BM25 + Dense Vector (mxbai-embed-large) + Cross-Encoder Reranker  
 - **Dynamic Retriever** → bobot otomatis berdasarkan jenis query (tanaman/cuaca/history)  
+- **Query Rewriting 3 lapis** → rule-based (0ms) → Qwen2.5 fallback (~800ms) → original  
 - **Data Real-time Pertanian**  
   - Cuaca harian + alert agronomi (kekeringan, banjir, heat stress, penyakit) dari Open-Meteo  
   - Informasi tanaman lengkap (spesies, hama, penyakit, panduan perawatan) via Perenual API + cache  
@@ -27,11 +28,12 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 ## Tech Stack
 
 - **LLM** : Llama 3.2 fine-tune → sugi-v0.1L (via Ollama)  
+- **Utility model** : Qwen2.5-1.5B — query rewriting fallback, plant name extraction, eval loop  
 - **Embedding** : mxbai-embed-large  
-- **Vector Store** : ChromaDB Server (separate collections: default, weather, plant, memory)  
+- **Vector Store** : ChromaDB Server (collections: langchain, weather_data, plant_data, conversation_memory)  
 - **Retriever** : Ensemble (BM25 + Vector) + Cross-Encoder reranker (ms-marco-MiniLM-L-6-v2)  
 - **API Eksternal** : Open-Meteo (cuaca), Perenual (tanaman & hama)  
-- **Lainnya** : LangChain, Watchdog (auto-index), phi3 (plant extraction fallback)  
+- **Lainnya** : LangChain, Watchdog (auto-index)  
 
 
 ## Instalasi (Local Development)
@@ -42,10 +44,15 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 - Ollama terinstall & jalankan model:
   ```bash
   ollama pull llama3.2
-  ollama pull phi3
+  ollama pull qwen2.5:1.5b   # utility model: rewriting + plant extraction + eval
   ollama create sugi-v0.1L -f Modelfile
   ollama pull mxbai-embed-large
   ```
+
+  > Kalau sebelumnya pakai phi3, bisa dihapus setelah Qwen berjalan normal:
+  > ```bash
+  > ollama rm phi3
+  > ```
 
 ### 2. Clone & Setup
 
@@ -182,6 +189,13 @@ sugi-v0.1L/
 
 ## Konfigurasi Lanjutan
 
+### Ubah utility model (Qwen2.5-1.5B)
+Di `main.py`, ubah konstanta `UTILITY_MODEL`:
+```python
+UTILITY_MODEL = "qwen2.5:1.5b"   # ganti dengan model Ollama lain jika perlu
+```
+Konstanta ini dipakai oleh tiga komponen sekaligus: query rewriting fallback, plant name extraction, dan eval loop — sehingga cukup ubah satu baris.
+
 ### Ubah keyword scope tanpa restart
 Edit `word_config/scope_config.ini`, tambahkan keyword baru di section yang sesuai, lalu restart `main.py`.
 
@@ -203,4 +217,4 @@ CHROMA_PORT = 8000          # ganti port jika perlu
 
 MIT License – bebas digunakan, dimodifikasi, dan dikembangkan lebih lanjut.
 
-Last updated: Maret 2026
+Last updated: Maret 2026 · v0.1L (Qwen2.5-1.5B upgrade)

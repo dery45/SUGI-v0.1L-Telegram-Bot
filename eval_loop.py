@@ -1,36 +1,11 @@
-"""
-eval_loop.py — Lightweight RAG evaluation loop untuk SUGI v0.1L
-
-Evaluasi dua dimensi per query secara otomatis:
-
-  faithfulness  — apakah jawaban LLM didukung oleh dokumen yang diambil?
-                  (mencegah halusinasi)
-  relevance     — apakah dokumen yang diambil relevan terhadap pertanyaan?
-                  (mengukur kualitas retrieval)
-
-Skala: LOW / MEDIUM / HIGH
-Flag: True jika faithfulness=LOW atau relevance=LOW → masuk eval_flags.jsonl
-
-Desain:
-  - Tidak pakai model besar — pakai heuristik cepat + LLM kecil (phi3)
-    hanya jika heuristik tidak konklusif.
-  - Hasil eval tidak mengubah jawaban yang sudah dikirim ke user.
-  - Semua hasil disimpan di trace untuk dianalisis offline.
-
-Tiga metode evaluasi (dipilih otomatis berdasarkan ketersediaan):
-  1. Heuristik lexical — cepat, zero-cost, akurasi sedang
-  2. LLM self-eval (phi3) — lebih akurat, +300-600ms latency
-  3. Fallback ke UNKNOWN jika keduanya gagal
-"""
-
 import re
 from typing import Optional
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# ─── Eval LLM (phi3 — ringan, tidak perlu GPU) ───────────────────────────────
-_eval_model = OllamaLLM(model="phi3", temperature=0)
+# ─── Eval LLM (Qwen2.5-1.5B — lebih kecil dari phi3, lebih baik Indonesia) ─────
+_eval_model = OllamaLLM(model="qwen2.5:1.5b", temperature=0)
 
 _FAITHFULNESS_PROMPT = ChatPromptTemplate.from_template("""
 You are evaluating an AI answer for faithfulness.

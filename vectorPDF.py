@@ -28,14 +28,59 @@ vector_store = Chroma(
     embedding_function=embeddings
 )
 
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    add_start_index=True
-)
+# ─── Chunk strategy per PDF type ─────────────────────────────────────────────
+# PDF regulasi/kebijakan (panjang, butuh konteks luas) → 800/100
+# PDF jurnal/penelitian (paragraf padat, satu ide per chunk) → 600/80
+# PDF harga/tabel (baris pendek, perlu exact match) → 250/25
+# Default (panduan budidaya, umum) → 500/50
+#
+# Deteksi otomatis berdasarkan nama file.
+# Tambah kata kunci di _PDF_TYPE_RULES untuk menyesuaikan.
+
+_PDF_TYPE_RULES = {
+    # keyword di nama file → (chunk_size, chunk_overlap, label)
+    "regulasi":   (800, 100, "regulasi"),
+    "permentan":  (800, 100, "regulasi"),
+    "kebijakan":  (800, 100, "regulasi"),
+    "undang":     (800, 100, "regulasi"),
+    "peraturan":  (800, 100, "regulasi"),
+    "jurnal":     (600,  80, "jurnal"),
+    "penelitian": (600,  80, "jurnal"),
+    "laporan":    (600,  80, "jurnal"),
+    "harga":      (250,  25, "harga"),
+    "price":      (250,  25, "harga"),
+    "komoditas":  (250,  25, "harga"),
+}
+_PDF_TYPE_DEFAULT = (500, 50, "default")
+
+
+def _get_splitter(file_name: str) -> tuple:
+    """
+    Pilih chunk_size dan overlap berdasarkan nama file.
+    Return: (splitter, type_label)
+    """
+    name_lower = file_name.lower()
+    for keyword, (size, overlap, label) in _PDF_TYPE_RULES.items():
+        if keyword in name_lower:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=size,
+                chunk_overlap=overlap,
+                add_start_index=True,
+            )
+            return splitter, label
+    # Default
+    size, overlap, label = _PDF_TYPE_DEFAULT
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=size,
+        chunk_overlap=overlap,
+        add_start_index=True,
+    )
+    return splitter, label
+
 
 def normalize(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
 
 def index_file(file_path: str):
     """Index a single PDF file into the vector store."""
@@ -50,14 +95,17 @@ def index_file(file_path: str):
 
     print(f"📄 New PDF: {file_name}")
     try:
-        loader = PyPDFLoader(file_path)
-        pages  = loader.load()
-        chunks = text_splitter.split_documents(pages)
+        loader              = PyPDFLoader(file_path)
+        pages               = loader.load()
+        splitter, pdf_type  = _get_splitter(file_name)
+        chunks              = splitter.split_documents(pages)
+        print(f"   Type: {pdf_type} | chunks: {len(chunks)}")
 
         documents = []
         ids       = []
         for chunk in chunks:
-            chunk.metadata["source"] = file_name
+            chunk.metadata["source"]   = file_name
+            chunk.metadata["pdf_type"] = pdf_type
             content      = normalize(chunk.page_content)
             combined_str = (
                 f"{content}_{file_name}"
