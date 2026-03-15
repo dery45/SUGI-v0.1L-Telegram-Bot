@@ -10,7 +10,6 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 [![MongoDB](https://img.shields.io/badge/MongoDB-Daily%20Insights-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
 ![Score](https://img.shields.io/badge/RAG%20Score-93%2F100-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Last Commit](https://img.shields.io/github/last-commit/ux/sugi-v0.1L?color=green)
 
 ## 🔥 Fitur Utama
 
@@ -263,4 +262,8 @@ CHROMA_PORT = 8000          # ganti port jika perlu
 
 MIT License – bebas digunakan, dimodifikasi, dan dikembangkan lebih lanjut.
 
+<<<<<<< HEAD
 Last updated: Maret 2026 · v0.1L (Qwen2.5-1.5B + MongoDB Daily Insight) · RAG Score 93/100
+=======
+Last updated: Maret 2026 · v0.1L (Qwen2.5-1.5B upgrade)
+>>>>>>> eb565a3307ea1b08d19a55d4fef5742defbc3231
