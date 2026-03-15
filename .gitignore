@@ -53,7 +53,14 @@ share/python-wheels/
 *.swp
 *~
 
-# Ollama & model-related (jika kamu simpan model lokal di repo – biasanya tidak)
+# SUGI query logs — berisi data percakapan user, jangan di-commit
+logs/
+!logs/.gitkeep
+
+# BM25 cache — bisa di-rebuild, tidak perlu di-commit
+bm25_cache.pkl
+
+# Ollama & model-related
 ollama/
 models/
 
@@ -85,7 +92,6 @@ coverage/
 # Dependency management
 Pipfile.lock
 poetry.lock
-requirements.txt  # <-- optional: jika kamu ingin ignore requirements.txt (bisa di-generate ulang)
 
 # Misc project-specific
 *.DS_Store
