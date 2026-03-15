@@ -1,16 +1,3 @@
-"""
-vectorCSV.py — CSV/XLSX indexer dengan chunk strategy per tipe data
-
-Perubahan dari versi sebelumnya:
-  - Chunk strategy berbeda per tipe file:
-      CSV tabular    → chunk_size=300,  overlap=30   (baris pendek, presisi tinggi)
-      XLSX sheet     → chunk_size=400,  overlap=50   (bisa lebih panjang per sel)
-      XLSX price     → chunk_size=200,  overlap=20   (data harga, mau exact match)
-      XLSX policy    → chunk_size=600,  overlap=80   (dokumen kebijakan, butuh konteks)
-  - Deteksi otomatis tipe sheet berdasarkan nama kolom
-  - Metadata diperkaya dengan detected_type untuk filtering di retriever
-"""
-
 import hashlib
 import os
 import pickle
@@ -25,7 +12,14 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-DB_PATH         = "chrome_longchain_db"
+# ─── ChromaDB server connection ──────────────────────────────────────────────
+# Ganti host/port sesuai setup kamu.
+# Default: server jalan di mesin yang sama (localhost:8000)
+# Remote server: ganti "localhost" dengan IP/hostname server
+import chromadb as _chromadb
+CHROMA_HOST = "localhost"
+CHROMA_PORT = 8000
+_chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 DATASET_DIR     = "dataset"
 EMBED_MODEL     = "mxbai-embed-large"
 BM25_CACHE_PATH = "bm25_cache.pkl"
@@ -80,7 +74,7 @@ def _get_splitter(data_type: str) -> RecursiveCharacterTextSplitter:
 # ─── Initialization ─────────────────────────────────────────────────────────
 embeddings   = OllamaEmbeddings(model=EMBED_MODEL)
 vector_store = Chroma(
-    persist_directory=DB_PATH,
+    client=_chroma_client,
     embedding_function=embeddings
 )
 

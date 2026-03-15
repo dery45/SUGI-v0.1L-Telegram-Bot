@@ -10,14 +10,21 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-DB_PATH     = "chrome_longchain_db"
 DATASET_DIR = "pdfsource"
 EMBED_MODEL = "mxbai-embed-large"
 
+# ─── ChromaDB server connection ──────────────────────────────────────────────
+# Ganti host/port sesuai setup kamu.
+# Default: server jalan di mesin yang sama (localhost:8000)
+import chromadb as _chromadb
+CHROMA_HOST = "localhost"
+CHROMA_PORT = 8000
+_chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+
 # ─── Initialization ─────────────────────────────────────────────────────────
-embeddings = OllamaEmbeddings(model=EMBED_MODEL)
+embeddings   = OllamaEmbeddings(model=EMBED_MODEL)
 vector_store = Chroma(
-    persist_directory=DB_PATH,
+    client=_chroma_client,
     embedding_function=embeddings
 )
 
@@ -86,14 +93,14 @@ def index_all_existing():
         index_file(file_path)
 
 
-# ─── Opt [5]: Watchdog event handler ────────────────────────────────────────
+# ─── Watchdog event handler ──────────────────────────────────────────────────
 class PDFHandler(FileSystemEventHandler):
     def _handle(self, event):
         if event.is_directory:
             return
         if event.src_path.lower().endswith(".pdf"):
             print(f"\n🔔 PDF event: {os.path.basename(event.src_path)}")
-            time.sleep(0.5)   # wait for OS to finish writing
+            time.sleep(0.5)
             index_file(event.src_path)
 
     def on_created(self, event):
@@ -113,6 +120,7 @@ retriever = vector_store.as_retriever(
 if __name__ == "__main__":
     os.makedirs(DATASET_DIR, exist_ok=True)
     print(f"🚀 PDF Vector Server started. Watching '{DATASET_DIR}/'...")
+    print(f"   ChromaDB: {CHROMA_HOST}:{CHROMA_PORT}")
 
     index_all_existing()
 

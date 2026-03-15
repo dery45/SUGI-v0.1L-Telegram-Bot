@@ -43,7 +43,14 @@ from eval_loop import evaluate
 # Models & Paths
 # ─────────────────────────────────────────────
 EMBED_MODEL       = "mxbai-embed-large"
-DB_PATH           = "chrome_longchain_db"
+# ─── ChromaDB server connection ──────────────────────────────────────────────
+# Ganti host/port sesuai setup kamu.
+# Default: server jalan di mesin yang sama (localhost:8000)
+# Remote server: ganti "localhost" dengan IP/hostname server
+import chromadb as _chromadb
+CHROMA_HOST = "localhost"
+CHROMA_PORT = 8000
+_chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 BM25_CACHE_PATH   = "bm25_cache.pkl"
 SCOPE_CONFIG_PATH   = "word_config/scope_config.ini"
 
@@ -64,7 +71,7 @@ MEMORY_TTL_DAYS = 14   # ganti sesuai kebutuhan (0 = tidak ada TTL)
 
 memory_store = Chroma(
     collection_name="conversation_memory",
-    persist_directory=DB_PATH,
+    client=_chroma_client,
     embedding_function=embeddings,
 )
 
