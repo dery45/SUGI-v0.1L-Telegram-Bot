@@ -1,20 +1,20 @@
-# DEPLOYMENT GUIDE — Sugi v0.1L Telegram Bot
+# DEPLOYMENT GUIDE — SUGI v0.1L Telegram Bot
 
-## Struktur File Baru
+## Implementation Structure
 
 ```
 Local_RAG_Langchain/
-├── sugi_core.py              ← Logic utama (Shared)
-├── user_store.py             ← Management user (Shared)
-├── .env                      ← Konfigurasi pusat (Root)
-└── telegram_connection/      ← Folder khusus Telegram
-    ├── telegram_bot.py       ← Entry point (Run this)
+├── sugi_core.py              ← Core Logic (Shared)
+├── user_store.py             ← User Management (Shared Root)
+├── .env                      ← Central Configuration (Root)
+└── telegram_connection/      ← Telegram Specific Folder
+    ├── telegram_bot.py       ← Entry Point (Run this)
     └── requirements_telegram.txt
 ```
 
 ---
 
-## Step 1 — Install Dependency
+## Step 1 — Install Dependencies
 
 ```bash
 pip install -r telegram_connection/requirements_telegram.txt
@@ -22,116 +22,89 @@ pip install -r telegram_connection/requirements_telegram.txt
 
 ---
 
-## Step 2 — Buat Telegram Bot
+## Step 2 — Create your Telegram Bot
 
-1. Buka Telegram, cari **@BotFather**
-2. Kirim `/newbot`
-3. Ikuti instruksi, masukkan nama dan username bot
-4. Salin **token** yang diberikan (format: `123456789:AAF...`)
-
----
-
-## Step 3 — Set Token
-
-Sugi menggunakan file `.env` di **root directory** untuk menyimpan token. 
-
-Buka file `.env` di root proyek dan tambahkan/edit baris berikut:
-```env
-TELEGRAM_BOT_TOKEN="123456789:AAFxxxx"
-```
-
-Pastikan tidak ada spasi di sekitar tanda `=` dan token diapit tanda kutip.
+1. Open Telegram and search for **@BotFather**
+2. Send the command `/newbot`
+3. Follow the instructions to give your bot a name and username.
+4. Copy the **token** provided (format: `123456789:AAF...`)
 
 ---
 
-## Step 4 — Jalankan Bot
+## Step 3 — Set the Token & Environment
+
+SUGI uses a `.env` file in the **root directory** for all configurations. Use `.env.example` as a template.
+
+### Key Environment Variables
+
+- `TELEGRAM_BOT_TOKEN`: The API Token from BotFather.
+- `DEBUG_ALLOWED_USERS`: A comma-separated list of Telegram user IDs (e.g., `123456,789012`). If empty, **all** users can use debug commands (`!debug`, `!session`, etc.). Use this to restrict access in production.
+- `MEMORY_TTL_DAYS`: How many days to keep session summaries in ChromaDB (default: `14`).
+- `SCOPE_CONFIG_PATH`: Path to the `.ini` file defining allowed agricultural topics.
+
+---
+
+## Step 4 — Launch the Bot
 
 ```bash
-# Pastikan terminal berada di root proyek (Local_RAG_Langchain)
+# Ensure your terminal is at the project root (Local_RAG_Langchain)
 python telegram_connection/telegram_bot.py
 ```
 
 ---
 
-## Fitur Bot Telegram
+## Bot Commands
 
-| Command     | Fungsi                                          |
-|-------------|------------------------------------------------|
-| `/start`    | Mulai / restart, tampilkan tombol share kontak  |
-| `/help`     | Panduan penggunaan                              |
-| `/history`  | Lihat ringkasan percakapan sebelumnya           |
-| `/clear`    | Reset sesi berjalan (memory lama tetap tersimpan)|
-| `/contact`  | Update nomor HP                                 |
-| `/about`    | Info tentang Sugi                               |
+| Command     | Description                                     |
+|-------------|-------------------------------------------------|
+| `/start`    | Start / Restart, prompts to share contact       |
+| `/help`     | User guide                                      |
+| `/history`  | View a summary of past conversations            |
+| `/clear`    | Reset current session (old memory persists)     |
+| `/contact`  | Update phone number                             |
+| `/about`    | Information about SUGI                          |
+| `/debug`    | (Admin) View current session performance        |
 
 ---
 
-## Data yang Disimpan per User
+## Data Management
 
-**data/users.json** (lokal):
-```json
-{
-  "123456789": {
-    "user_id": "123456789",
-    "platform": "telegram",
-    "username": "petani_jawa",
-    "full_name": "Budi Santoso",
-    "phone_number": "+628123456789",
-    "first_seen": "2025-01-01T10:00:00",
-    "last_seen": "2025-01-15T14:30:00",
-    "visit_count": 12,
-    "session_ids": ["123456789_20250101_100000", ...]
-  }
-}
-```
+**user_store.py / data/users.json** (Local):
+- Stores user profiles, phone numbers, and visit statistics.
+- Shared between platforms (CLI and Bot).
 
 **ChromaDB (conversation_memory collection)**:
-- Ringkasan percakapan per sesi
-- Di-query saat user kembali untuk context continuity
-- TTL: 14 hari (bisa diubah di sugi_core.py)
+- Stores session-based summaries.
+- Queried when users return for context continuity.
+- Managed via `MEMORY_TTL_DAYS` (default active).
 
 ---
 
-## Deploy ke Server (Opsional)
+## Server Deployment (Optional)
 
-### Menggunakan systemd (Linux):
+### Using systemd (Linux):
 
 ```ini
 # /etc/systemd/system/sugi-bot.service
 [Unit]
-Description=Sugi Telegram Bot
+Description=SUGI Telegram Bot
 After=network.target
 
 [Service]
 WorkingDirectory=/path/to/Local_RAG_Langchain
-Environment=TELEGRAM_BOT_TOKEN=<token>
-ExecStart=/path/to/venv/bin/python telegram_bot.py
+EnvironmentFile=/path/to/Local_RAG_Langchain/.env
+ExecStart=/path/to/venv/bin/python telegram_connection/telegram_bot.py
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-```bash
-sudo systemctl enable sugi-bot
-sudo systemctl start sugi-bot
-sudo systemctl status sugi-bot
-```
-
-### Menggunakan PM2 (Node.js process manager):
-
-```bash
-npm install -g pm2
-pm2 start "python telegram_bot.py" --name sugi-bot
-pm2 startup
-pm2 save
-```
-
 ---
 
-## Catatan Penting
+## Important Security Notes
 
-- **Ollama harus berjalan** sebelum bot dijalankan
-- **ChromaDB server** harus aktif di `localhost:8000`
-- Nomor HP hanya tersedia jika user **share contact** secara sukarela
-- Bot hanya merespons pertanyaan **dalam scope pertanian**
+1. **Debugging Safety**: Always set `DEBUG_ALLOWED_USERS` in production to prevent unauthorized access to query logs and session metadata.
+2. **Context Window**: The system uses `num_ctx=4096` to prevent overflow errors. Ensure your local Ollama model supports this size.
+3. **Embedding Limit**: Documents over 3,000 characters are automatically truncated during storage to fit within the `mxbai-embed-large` 512-token limit.
+4. **Ollama Process**: Ollama must be running as a background service before starting the bot.
