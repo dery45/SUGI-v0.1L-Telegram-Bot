@@ -20,9 +20,12 @@ import chromadb as _chromadb
 CHROMA_HOST = "localhost"
 CHROMA_PORT = 8000
 _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-DATASET_DIR     = "dataset"
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+DATASET_DIR     = str(_ROOT / "data" / "raw_dataset")
 EMBED_MODEL     = "mxbai-embed-large"
-BM25_CACHE_PATH = "bm25_cache.pkl"
+BM25_CACHE_PATH = str(_ROOT / "data" / "db" / "bm25_cache.pkl")
 
 # ─── Per-type chunk strategies ───────────────────────────────────────────────
 # Setiap strategi disesuaikan dengan karakteristik data:

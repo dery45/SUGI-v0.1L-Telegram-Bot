@@ -7,12 +7,15 @@ ENV/
 env.bak/
 venv.bak/
 
-# ChromaDB vector database (persist directory)
-chrome_longchain_db/
-chroma_db/
-chromadb/
+# ChromaDB / Persistent Data Directories
+data/db/
+data/raw_dataset/
+data/raw_pdfs/
+data/logs/
 chroma/
 *.sqlite3
+weather_cache.sqlite
+.weather_cache.sqlite
 
 # Environment variables & secrets
 .env
@@ -103,13 +106,8 @@ poetry.lock
 temp/
 tmp/
 
-# Data sources — jangan di-commit karena bisa sangat besar
-dataset/*
-!dataset/.gitkeep
-pdfsource/*
-!pdfsource/.gitkeep
-
 # User data & platform-specific databases
-telegram_connection/data/
-data/
-users.json
+data/users.json
+data/cli_user.txt
+data/bm25_cache.pkl
+data/db/bm25_cache.pkl

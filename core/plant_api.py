@@ -22,11 +22,14 @@ import requests
 from typing import Optional
 
 from dotenv import load_dotenv
+from pathlib import Path
+
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 
-load_dotenv()
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / "config" / ".env")
 
 PERENUAL_KEY     = os.getenv("PERENUAL_API_KEY", "")
 PERENUAL_BASE    = "https://perenual.com/api/v2"

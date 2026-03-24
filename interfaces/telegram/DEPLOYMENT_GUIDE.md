@@ -4,12 +4,15 @@
 
 ```
 Local_RAG_Langchain/
-├── sugi_core.py              ← Core Logic (Shared)
-├── user_store.py             ← User Management (Shared Root)
-├── .env                      ← Central Configuration (Root)
-└── telegram_connection/      ← Telegram Specific Folder
-    ├── telegram_bot.py       ← Entry Point (Run this)
-    └── requirements_telegram.txt
+├── core/
+│   ├── sugi_core.py          ← Core Logic (Shared)
+│   └── user_store.py         ← User Management (Shared)
+├── config/
+│   └── .env                  ← Central Configuration
+└── interfaces/
+    └── telegram/             ← Telegram Specific Folder
+        ├── telegram_bot.py   ← Entry Point (Run this)
+        └── requirements.txt
 ```
 
 ---
@@ -17,7 +20,7 @@ Local_RAG_Langchain/
 ## Step 1 — Install Dependencies
 
 ```bash
-pip install -r telegram_connection/requirements_telegram.txt
+pip install -r interfaces/telegram/requirements.txt
 ```
 
 ---
@@ -48,7 +51,7 @@ SUGI uses a `.env` file in the **root directory** for all configurations. Use `.
 
 ```bash
 # Ensure your terminal is at the project root (Local_RAG_Langchain)
-python telegram_connection/telegram_bot.py
+python interfaces/telegram/telegram_bot.py
 ```
 
 ---
@@ -92,8 +95,8 @@ After=network.target
 
 [Service]
 WorkingDirectory=/path/to/Local_RAG_Langchain
-EnvironmentFile=/path/to/Local_RAG_Langchain/.env
-ExecStart=/path/to/venv/bin/python telegram_connection/telegram_bot.py
+EnvironmentFile=/path/to/Local_RAG_Langchain/config/.env
+ExecStart=/path/to/venv/bin/python interfaces/telegram/telegram_bot.py
 Restart=always
 
 [Install]

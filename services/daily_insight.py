@@ -36,7 +36,9 @@ from typing import Any
 # ── Env loading ───────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+    from pathlib import Path
+    _ROOT = Path(__file__).resolve().parent.parent
+    load_dotenv(_ROOT / "config" / ".env")
 except ImportError:
     # dotenv opsional — bisa set env variable manual
     pass

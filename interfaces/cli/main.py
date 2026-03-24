@@ -9,19 +9,19 @@ Perubahan:
 """
 
 import os
+import sys
 from pathlib import Path
-from dotenv import load_dotenv
 
-_ROOT = Path(__file__).resolve().parent
-load_dotenv(_ROOT / ".env")
+_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_ROOT))
 
-from sugi_core import SugiCore
-from user_store import UserStore
+from core.sugi_core import SugiCore
+from core.user_store import UserStore
 
 # ─────────────────────────────────────────────
 # CLI User ID — persistent lintas run
 # ─────────────────────────────────────────────
-CLI_USER_FILE = Path("data/cli_user.txt")
+CLI_USER_FILE = _ROOT / "data" / "cli_user.txt"
 
 
 def get_or_create_cli_user_id() -> str:

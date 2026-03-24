@@ -23,9 +23,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# ─── Load .env dari root proyek ───────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent
-load_dotenv(_ROOT / ".env")
+# ─── Load .env dari config folder ─────────────────────────────────────────────
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / "config" / ".env")
 
 from langchain_ollama.llms import OllamaLLM
 from langchain_chroma import Chroma
@@ -42,8 +42,8 @@ from langchain_classic.retrievers.document_compressors import CrossEncoderRerank
 
 import chromadb as _chromadb
 
-from vectorCSV import vector_store
-from query_logger import (
+from services.vectorCSV import vector_store
+from core.query_logger import (
     new_query_trace, set_docs, commit_trace,
     print_debug_report, flagged_logs, session_logs,
 )
@@ -269,7 +269,7 @@ class SugiCore:
 
         # ── Weather store (jika ada) ──────────────────────────────────────────
         try:
-            from vectorWeather import weather_store as _ws
+            from services.vectorWeather import weather_store as _ws
             self.weather_store = _ws
             print("🌤️  Weather store loaded.")
         except ImportError:
@@ -278,7 +278,7 @@ class SugiCore:
 
         # ── Plant store (jika ada) ────────────────────────────────────────────
         try:
-            from plant_api import (
+            from core.plant_api import (
                 search_plant_info, is_plant_cached,
                 get_cached_plant_docs, plant_store,
             )
@@ -296,7 +296,7 @@ class SugiCore:
 
         # ── Eval loop (jika ada) ──────────────────────────────────────────────
         try:
-            from eval_loop import evaluate as _evaluate
+            from core.eval_loop import evaluate as _evaluate
             self._evaluate = _evaluate
             print("🔬  Eval loop loaded.")
         except ImportError:

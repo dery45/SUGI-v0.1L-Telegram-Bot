@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Optional
 
 
-USER_DB_PATH = Path("data/users.json")
+_ROOT = Path(__file__).resolve().parent.parent
+USER_DB_PATH = _ROOT / "data" / "users.json"
 
 
 class UserStore:

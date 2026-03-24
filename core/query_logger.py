@@ -28,7 +28,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-LOG_DIR  = Path("logs")
+_ROOT = Path(__file__).resolve().parent.parent
+LOG_DIR  = _ROOT / "data" / "logs"
 LOG_FILE = LOG_DIR / "queries.jsonl"
 EVAL_FILE = LOG_DIR / "eval_flags.jsonl"  # hanya entry yang flagged
 

@@ -10,7 +10,10 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-DATASET_DIR = "pdfsource"
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+DATASET_DIR = str(_ROOT / "data" / "raw_pdfs")
 EMBED_MODEL = "mxbai-embed-large"
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────

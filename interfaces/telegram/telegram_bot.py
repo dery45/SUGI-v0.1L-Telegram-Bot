@@ -20,11 +20,11 @@ import asyncio
 from pathlib import Path
 
 # ─── Path setup ───────────────────────────────────────────────────────────────
-_ROOT = Path(__file__).resolve().parent.parent
+_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from dotenv import load_dotenv
-load_dotenv(_ROOT / ".env")
+load_dotenv(_ROOT / "config" / ".env")
 
 from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from telegram.ext import (
@@ -36,8 +36,8 @@ from telegram.ext import (
 )
 from telegram.constants import ChatAction
 
-from sugi_core import SugiCore
-from user_store import UserStore
+from core.sugi_core import SugiCore
+from core.user_store import UserStore
 
 # ─────────────────────────────────────────────
 # Config

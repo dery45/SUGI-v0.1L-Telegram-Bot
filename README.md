@@ -82,40 +82,36 @@ Create a `.env` file in the project root based on `.env.example`. Key settings i
 | `MEMORY_TTL_DAYS` | Days to keep session summaries | `14` |
 | `BM25_CACHE_PATH` | Path to BM25 index file | `bm25_cache.pkl` |
 
-### 4. ChromaDB Server ⚠️ Required before running other scripts
-
-SUGI uses ChromaDB in **server mode** to allow simultaneous indexing and serving.
+### 4. Database Server
+ChromaDB must be running in the background before any AI queries or indexing.
 
 **Run server (Terminal 1):**
 ```bash
-chroma run --path ./chrome_longchain_db --port 8000
+chroma run --path data/db --port 8000
 ```
 
-### 5. Running the Pipeline
+### 5. Running the Application Pipeline
+You can now start all RAG services and the Telegram bot with a single command:
 
+**Run pipeline (Terminal 2):**
 ```bash
-python vectorCSV.py      # Terminal 2 — Index CSV/XLSX
-python vectorpdf.py      # Terminal 3 — Index PDF
-python vectorWeather.py  # Terminal 4 — Refresh weather (every 5 mins)
-python telegram_connection/telegram_bot.py  # Terminal 5 — Start Bot
-python main.py           # Terminal 6 — Start CLI (Optional)
-python daily_insight.py  # Terminal 7 — Start Insight Engine (Optional)
+python start_all.py
 ```
+*(Alternatively, you can run `python interfaces/cli/main.py` to run the terminal client).*
 
-## Folder Structure
+## Project Architecture
 
 ```
-sugi-v0.1L/
-├── dataset/                  # CSV/XLSX (Excluded by Git)
-├── pdfsource/                # PDF Documents (Excluded by Git)
-├── chrome_longchain_db/      # ChromaDB data (Excluded by Git)
-├── word_config/              # Domain & keyword rules (.ini)
-├── telegram_connection/      # Telegram Bot modules
-├── sugi_core.py              # Shared Core Logic
-├── user_store.py             # Shared User Management
-├── main.py                   # CLI Entry point
-├── .env                      # Unified Configuration
-└── requirements.txt
+SUGI-v0.1L/
+├── config/                   # Settings and .env config
+├── core/                     # Shared Engine Logic (sugi_core.py, etc.)
+├── data/                     # Vector DB, logs, raw data (Excluded by Git)
+├── interfaces/               # Entry points (cli & telegram bot)
+├── services/                 # Background crawlers (vector indexers, insights)
+├── tests/                    # Testing utilities
+├── start_all.py              # Master deployment script
+├── README.md                 # Project Overview
+└── requirements.txt          # Shared requirements
 ```
 
 ## License
