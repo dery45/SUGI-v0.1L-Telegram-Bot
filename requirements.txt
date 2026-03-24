@@ -37,3 +37,7 @@ requests>=2.32
 openmeteo-requests>=0.3
 requests-cache>=1.2
 retry-requests>=2.0
+
+# Database & Insights
+pymongo[srv]>=4.0
+certifi>=2024.2.2

@@ -54,11 +54,12 @@ if not MONGO_URI:
 try:
     from pymongo import MongoClient, UpdateOne
     from pymongo.errors import PyMongoError
+    import certifi
 except ImportError:
-    print("❌  pymongo belum terinstall. Jalankan: pip install pymongo")
+    print("❌  pymongo / certifi belum terinstall. Jalankan: pip install pymongo certifi")
     sys.exit(1)
 
-_mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000)
+_mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=10_000, tlsCAFile=certifi.where())
 _db           = _mongo_client["sugi_insights"]
 
 # Koleksi per kategori

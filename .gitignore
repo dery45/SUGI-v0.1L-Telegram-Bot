@@ -108,3 +108,8 @@ dataset/*
 !dataset/.gitkeep
 pdfsource/*
 !pdfsource/.gitkeep
+
+# User data & platform-specific databases
+telegram_connection/data/
+data/
+users.json
