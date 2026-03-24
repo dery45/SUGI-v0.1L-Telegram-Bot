@@ -202,7 +202,7 @@ def index_file(file_path: str):
             return
         for sheet_name, df in sheets.items():
             existing = vector_store.get(
-                where={"source": file_name, "sheet": sheet_name}, limit=1
+                where={"$and": [{"source": file_name}, {"sheet": sheet_name}]}, limit=1
             )
             if existing["ids"]:
                 continue
