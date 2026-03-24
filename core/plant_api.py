@@ -190,6 +190,7 @@ def _store_docs(documents: list[Document]):
     if not documents:
         return
     from datetime import datetime as _dt
+    now_iso = _dt.now().isoformat()
     # Inject cached_at dan truncating content agar tidak melebih context embedding (512 tokens)
     for doc in documents:
         doc.metadata["cached_at"] = now_iso
