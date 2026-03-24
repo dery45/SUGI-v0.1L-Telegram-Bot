@@ -11,6 +11,8 @@ venv.bak/
 chrome_longchain_db/
 chroma_db/
 chromadb/
+chroma/
+*.sqlite3
 
 # Environment variables & secrets
 .env
@@ -58,6 +60,7 @@ logs/
 !logs/.gitkeep
 
 # BM25 cache — bisa di-rebuild, tidak perlu di-commit
+*.pkl
 bm25_cache.pkl
 
 # Ollama & model-related
@@ -99,3 +102,9 @@ poetry.lock
 *.backup
 temp/
 tmp/
+
+# Data sources — jangan di-commit karena bisa sangat besar
+dataset/*
+!dataset/.gitkeep
+pdfsource/*
+!pdfsource/.gitkeep

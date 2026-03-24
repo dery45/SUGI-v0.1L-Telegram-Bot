@@ -93,25 +93,15 @@ _api_rate_limited = False
 
 
 # ─── HTTP helper dengan flat retry ───────────────────────────────────────────
-_MAX_RETRIES  = 2      # max 2 retry (3 attempt total) — gagal cepat
+_MAX_RETRIES  = 0      # max 0 retry (1 attempt total) — gagal cepat
 _BACKOFF_FLAT = 1.5    # detik flat per retry — tidak eksponensial
 _JITTER_MAX   = 0.3    # jitter kecil untuk menghindari thundering herd
 
 
 def _get(url: str, params: dict) -> Optional[dict]:
-    """
-    GET request ke Perenual API dengan:
-      - Token bucket rate limiting (tunggu giliran sebelum kirim)
-      - Flat retry untuk 429 Too Many Requests (max 2 retry)
-      - Menghormati header Retry-After kalau ada (capped 3 detik)
-      - Jitter kecil di setiap delay
-
-    Retry schedule (tanpa jitter):
-      Attempt 1: langsung
-      Attempt 2: tunggu 1.5s
-      Attempt 3: tunggu 1.5s → lalu return None
-    Total worst-case tunggu: ~3 detik (vs 30+ detik sebelumnya)
-    """
+    global _api_rate_limited
+    if _api_rate_limited:
+        return None
     attempt = 0
 
     while attempt <= _MAX_RETRIES:
@@ -124,7 +114,6 @@ def _get(url: str, params: dict) -> Optional[dict]:
             if resp.status_code == 429:
                 attempt += 1
                 if attempt > _MAX_RETRIES:
-                    global _api_rate_limited
                     _api_rate_limited = True
                     print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan untuk sesi ini.")
                     print(f"   ℹ️  Jawaban akan menggunakan data RAG lokal.")
@@ -198,10 +187,11 @@ def _store_docs(documents: list[Document]):
     if not documents:
         return
     from datetime import datetime as _dt
-    now_iso = _dt.now().isoformat(timespec="seconds")
-    # Inject cached_at ke semua dokumen
+    # Inject cached_at dan truncating content agar tidak melebih context embedding (512 tokens)
     for doc in documents:
         doc.metadata["cached_at"] = now_iso
+        if len(doc.page_content) > 3000:
+            doc.page_content = doc.page_content[:3000] + "..."
     ids      = [doc.id for doc in documents]
     existing = plant_store.get(ids=ids)["ids"]
     new_docs = [d for d in documents if d.id not in existing]

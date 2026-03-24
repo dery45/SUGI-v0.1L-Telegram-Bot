@@ -14,18 +14,21 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 ## 🔥 Fitur Utama
 
 - **RAG Hybrid** → BM25 + Dense Vector (mxbai-embed-large) + Cross-Encoder Reranker  
+- **Multi-Platform** → CLI interface & **Telegram Bot Integration**  
 - **Dynamic Retriever** → bobot otomatis berdasarkan jenis query (tanaman/cuaca/history)  
 - **Query Rewriting 3 lapis** → rule-based (0ms) → Qwen2.5 fallback (~800ms) → original  
+- **Performa Tinggi (Try 2 Times)** → Riwayat dibatasi 2 turn & Retrieval k=2 untuk respon instan.
 - **Data Real-time Pertanian**  
   - Cuaca harian + alert agronomi (kekeringan, banjir, heat stress, penyakit) dari Open-Meteo  
-  - Informasi tanaman lengkap (spesies, hama, penyakit, panduan perawatan) via Perenual API + cache  
+  - Informasi tanaman lengkap (spesies, hama, penyakit, panduan perawatan) via Perenual API  
+  - **Fast Failure API** → Gagal dalam <1 detik jika rate limit (429), langsung pakai RAG lokal.
   - Indexing otomatis CSV/XLSX/PDF (harga komoditas, panduan budidaya, dll.)  
+- **Stability Guard** → Truncation 8000 char & context window 4096 untuk mencegah error context overflow.
 - **Long-term Memory** → ringkasan sesi disimpan di ChromaDB untuk konteks multi-turn  
 - **Daily Insight Engine** → kirim insight harian ke MongoDB setiap 12 jam (harga per provinsi, cuaca, saran tanam, kebijakan, ringkasan sesi)  
 - **Config Berbasis INI** → semua keyword & peta tanaman di `word_config/`, tidak perlu ubah kode  
-- **Scope Guard Ketat** → hanya jawab topik pertanian, tolak hal di luar domain dengan ramah  
-- **Personality** → ramah & mudah dipahami petani, profesional untuk pemerintah/investor  
-- **Bahasa** → default Indonesia, switch ke English jika user pakai English  
+- **Scope Guard** → Hanya jawab topik pertanian & perkebunan.  
+- **Bahasa** → Cerdas mendeteksi Bahasa Indonesia & English.  
 
 
 ## Tech Stack
@@ -36,7 +39,7 @@ Asisten AI berbasis RAG khusus untuk petani, pekebun, pemerintah, dan pelaku agr
 | **Utility model** | `qwen2.5:1.5b` — query rewriting fallback, plant name extraction, eval loop, daily insight |
 | **Embedding** | `mxbai-embed-large` |
 | **Vector Store** | ChromaDB Server mode — 4 collections: `langchain`, `weather_data`, `plant_data`, `conversation_memory` |
-| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=5) |
+| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=4, k=2) |
 | **Insight DB** | MongoDB — 5 collections di database `sugi_insights` |
 | **API Eksternal** | Open-Meteo (cuaca gratis), Perenual (tanaman & hama) |
 | **Framework** | LangChain, LangChain-Classic |
@@ -74,11 +77,16 @@ pip install -r requirements.txt
 
 ### 3. Konfigurasi
 
-Buat file `.env` di root:
+Buat file `.env` di root proyek:
 ```env
-PERENUAL_API_KEY=sk-your-perenual-key-here
-MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/   # wajib untuk daily_insight.py
-PORT=3000
+TELEGRAM_BOT_TOKEN="123456789:AAF..."  # Token dari @BotFather
+LLM_MODEL="sugi-v0.1L"
+EMBED_MODEL="mxbai-embed-large"
+UTILITY_MODEL="qwen2.5:1.5b"
+PERENUAL_API_KEY="sk-..."             # Opsional untuk data tanaman global
+MONGO_URI="mongodb+srv://..."         # Opsional untuk daily_insight.py
+CHROMA_HOST="localhost"
+CHROMA_PORT=8000
 ```
 
 Sesuaikan lokasi di `vectorWeather.py` jika bukan Jakarta:
@@ -158,11 +166,12 @@ Ketik pertanyaan pertanian, ketik `q` untuk keluar & simpan memory sesi.
 
 ```
 Terminal 1:  chroma run --path ./chrome_longchain_db --port 8000
-Terminal 2:  python vectorCSV.py
-Terminal 3:  python vectorpdf.py
-Terminal 4:  python vectorWeather.py
-Terminal 5:  python main.py
-Terminal 6:  python daily_insight.py          # opsional — kirim insight ke MongoDB
+Terminal 2:  python vectorCSV.py       # Indexing dataset
+Terminal 3:  python vectorpdf.py       # Indexing PDF
+Terminal 4:  python vectorWeather.py   # Monitoring cuaca
+Terminal 5:  python telegram_connection/telegram_bot.py   # Bot Aktif
+Terminal 6:  python main.py            # CLI mode (opsional)
+Terminal 7:  python daily_insight.py   # Insight engine (opsional)
 ```
 
 
@@ -170,27 +179,29 @@ Terminal 6:  python daily_insight.py          # opsional — kirim insight ke Mo
 
 ```
 sugi-v0.1L/
-├── dataset/                  # taruh CSV/XLSX harga, panduan budidaya
-├── pdfsource/                # taruh PDF regulasi, jurnal pertanian
+├── dataset/                  # Dataset CSV/XLSX
+├── pdfsource/                # Dokumen PDF source
 ├── chrome_longchain_db/      # ChromaDB data dir (jangan commit — ada di .gitignore)
 ├── logs/                     # query logs JSONL (jangan commit — ada di .gitignore)
 │   ├── queries.jsonl         # semua query + eval result
 │   └── eval_flags.jsonl      # query yang di-flag (faithfulness/relevance rendah)
-├── word_config/              # konfigurasi keyword (edit tanpa ubah kode)
-│   ├── scope_config.ini      # allowed/blocked topics + greeting patterns
-│   ├── rewriter_config.ini   # referential words, followup patterns, topic keywords
-│   └── plant_keywords.ini    # plant name map + strong/weak keywords
-├── main.py                   # program utama — chatbot loop 8 layer
+├── telegram_connection/      # Folder khusus Telegram
+│   ├── telegram_bot.py       # Entry point bot
+│   └── requirements_telegram.txt
+├── user_store.py             # Management database user lokal (Shared Root)
+├── word_config/              # Domain & keyword rules (.ini)
+├── sugi_core.py              # Logic utama (Shared)
+├── main.py                   # Chatbot loop (CLI version)
 ├── daily_insight.py          # insight engine — kirim ke MongoDB setiap 12 jam
-├── vectorCSV.py              # indexer CSV/XLSX
-├── vectorpdf.py              # indexer PDF
-├── vectorWeather.py          # fetcher + indexer cuaca Open-Meteo
+├── vectorCSV.py              # Server indexer CSV
+├── vectorpdf.py              # Server indexer PDF
+├── vectorWeather.py          # Server monitor cuaca
 ├── plant_api.py              # Perenual API client + exponential backoff + cache
 ├── eval_loop.py              # RAG eval (faithfulness + relevance)
 ├── query_logger.py           # structured query logging ke JSONL
 ├── migrate_to_server.py      # migrasi data dari embedded → server mode
 ├── Modelfile                 # definisi model sugi-v0.1L (Llama 3.2 base)
-├── .env                      # API keys & MongoDB URI (jangan commit)
+├── .env                      # Sentralisasi konfigurasi
 ├── .env.example
 ├── .gitignore
 └── requirements.txt
@@ -262,8 +273,4 @@ CHROMA_PORT = 8000          # ganti port jika perlu
 
 MIT License – bebas digunakan, dimodifikasi, dan dikembangkan lebih lanjut.
 
-<<<<<<< HEAD
 Last updated: Maret 2026 · v0.1L (Qwen2.5-1.5B + MongoDB Daily Insight) · RAG Score 93/100
-=======
-Last updated: Maret 2026 · v0.1L (Qwen2.5-1.5B upgrade)
->>>>>>> eb565a3307ea1b08d19a55d4fef5742defbc3231

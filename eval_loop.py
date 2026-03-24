@@ -5,7 +5,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # ─── Eval LLM (Qwen2.5-1.5B — lebih kecil dari phi3, lebih baik Indonesia) ─────
-_eval_model = OllamaLLM(model="qwen2.5:1.5b", temperature=0)
+_eval_model = OllamaLLM(model="qwen2.5:1.5b", temperature=0, num_ctx=4096)
 
 _FAITHFULNESS_PROMPT = ChatPromptTemplate.from_template("""
 You are evaluating an AI answer for faithfulness.
