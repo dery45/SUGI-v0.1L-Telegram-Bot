@@ -62,6 +62,26 @@ plant_store = Chroma(
     embedding_function=_embeddings,
 )
 
+# ─── API Key Validation on Startup ────────────────────────────────────────────
+if PERENUAL_KEY and PERENUAL_KEY != "sk-your-api-key-here":
+    try:
+        print("🔍  Validating Perenual API key...")
+        _test_resp = requests.get(
+            f"{PERENUAL_BASE}/species-list",
+            params={"key": PERENUAL_KEY},
+            timeout=5
+        )
+        if _test_resp.status_code in (401, 403):
+            print("   ❌ Invalid Perenual API Key! Plant features disabled.")
+            PERENUAL_KEY = ""
+        elif _test_resp.status_code == 429:
+            print("   ⚠️  Perenual API 429 Rate Limit hit on startup — pausing 1 hour.")
+            _api_rate_limit_until = time.time() + 3600
+        else:
+            print("   ✅ Perenual API key valid.")
+    except Exception as _e:
+        print(f"   ⚠️  API validation error: {_e}")
+
 
 # ─── Token bucket rate limiter ────────────────────────────────────────────────
 class _ApiQueue:
@@ -89,10 +109,9 @@ class _ApiQueue:
 _queue = _ApiQueue(min_interval=1.1)
 
 # ─── Session-level rate limit flag ──────────────────────────────────────────
-# Di-set True saat _get() menyerah setelah semua retry habis karena 429.
-# Semua fungsi API cek flag ini — kalau True langsung return kosong tanpa retry.
-# Reset ke False hanya saat restart program.
-_api_rate_limited = False
+# Di-set ke waktu +1 jam saat _get() menyerah setelah semua retry habis karena 429.
+# Fungsi API akan skip request jika waktu sekarang < flag ini.
+_api_rate_limit_until = 0.0
 
 
 # ─── HTTP helper dengan flat retry ───────────────────────────────────────────
@@ -102,8 +121,8 @@ _JITTER_MAX   = 0.3    # jitter kecil untuk menghindari thundering herd
 
 
 def _get(url: str, params: dict) -> Optional[dict]:
-    global _api_rate_limited
-    if _api_rate_limited:
+    global _api_rate_limit_until
+    if time.time() < _api_rate_limit_until:
         return None
     attempt = 0
 
@@ -117,9 +136,9 @@ def _get(url: str, params: dict) -> Optional[dict]:
             if resp.status_code == 429:
                 attempt += 1
                 if attempt > _MAX_RETRIES:
-                    _api_rate_limited = True
-                    print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan untuk sesi ini.")
-                    print(f"   ℹ️  Jawaban akan menggunakan data RAG lokal.")
+                    _api_rate_limit_until = time.time() + 3600
+                    print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan selama 1 jam.")
+                    print(f"   ℹ️  Jawaban akan sementara menggunakan data RAG lokal.")
                     return None
 
                 # Cek header Retry-After dari server, tapi cap di 3 detik
@@ -422,7 +441,7 @@ def get_cached_plant_docs(plant_name: str, k: int = 6) -> list[Document]:
 
 
 def search_plant_info(plant_name: str) -> list[Document]:
-    if _api_rate_limited:
+    if time.time() < _api_rate_limit_until:
         print("   ⏭️  Perenual API dinonaktifkan (429 sebelumnya) — pakai RAG lokal.")
         return []
     if not PERENUAL_KEY or PERENUAL_KEY == "sk-your-api-key-here":

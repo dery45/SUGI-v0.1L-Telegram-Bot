@@ -246,18 +246,36 @@ class SugiTelegramBot:
             return
 
         # ── Pertanyaan biasa ──────────────────────────────────────────────────
-        await context.bot.send_chat_action(
-            chat_id=update.effective_chat.id, action=ChatAction.TYPING
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            self._keep_typing(update.effective_chat.id, context.bot, stop_typing)
         )
 
-        response = await asyncio.to_thread(
-            self.sugi.ask,
-            user_id  = user_id,
-            question = question,
-            platform = "telegram",
-        )
+        try:
+            response = await asyncio.to_thread(
+                self.sugi.ask,
+                user_id  = user_id,
+                question = question,
+                platform = "telegram",
+            )
+        finally:
+            stop_typing.set()
+            await typing_task
 
         await self._send_long(update, response)
+
+    # ── Helper: typing indicator loop ─────────────────────────────────────────
+    async def _keep_typing(self, chat_id, bot, stop_event: asyncio.Event):
+        while not stop_event.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            # Cek event per 0.5s supaya cepat berhenti saat selesai
+            for _ in range(8):
+                if stop_event.is_set():
+                    break
+                await asyncio.sleep(0.5)
 
     # ── Helper: kirim pesan panjang ───────────────────────────────────────────
     async def _send_long(self, update: Update, text: str):

@@ -17,6 +17,7 @@ import hashlib
 import pickle
 import os
 import re
+import threading
 import configparser as _cp
 from datetime import datetime
 from pathlib import Path
@@ -250,6 +251,8 @@ class SugiCore:
     def __init__(self):
         print(f"⚙️  Config: LLM={LLM_MODEL} | Embed={EMBED_MODEL} | "
               f"Chroma={CHROMA_HOST}:{CHROMA_PORT}")
+
+        self._session_lock = threading.Lock()
 
         # ── Models ────────────────────────────────────────────────────────────
         self.model = OllamaLLM(
@@ -523,7 +526,8 @@ class SugiCore:
 
             # Simpan memory setiap 5 pertanyaan
             if len(session["history"]) % 5 == 0:
-                self._save_session_memory(user_id, session)
+                session_copy = {"history": list(session["history"]), "session_id": session["session_id"]}
+                threading.Thread(target=self._save_session_memory, args=(user_id, session_copy), daemon=True).start()
 
             # ── [4] Eval Loop ─────────────────────────────────────────────────
             print("\n🔬  Running eval...")
@@ -577,12 +581,13 @@ class SugiCore:
 
     def clear_session(self, user_id: str):
         """Reset in-memory history untuk user (long-term memory di ChromaDB tetap ada)."""
-        if user_id in self._sessions:
-            self._save_session_memory(user_id, self._sessions[user_id])
-            self._sessions[user_id]["history"]    = []
-            self._sessions[user_id]["session_id"] = (
-                f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            )
+        with self._session_lock:
+            if user_id in self._sessions:
+                self._save_session_memory(user_id, self._sessions[user_id])
+                self._sessions[user_id]["history"]    = []
+                self._sessions[user_id]["session_id"] = (
+                    f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                )
         print(f"🗑️  Session cleared for {user_id}")
 
     # ── [6] Debug Commands ────────────────────────────────────────────────────
@@ -977,11 +982,12 @@ class SugiCore:
     # ═══════════════════════════════════════════════════════════════════════════
 
     def _get_or_create_session(self, user_id: str) -> dict:
-        if user_id not in self._sessions:
-            session_id = f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            self._sessions[user_id] = {"history": [], "session_id": session_id}
-            print(f"🆕  New session for {user_id}: {session_id}")
-        return self._sessions[user_id]
+        with self._session_lock:
+            if user_id not in self._sessions:
+                session_id = f"{user_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+                self._sessions[user_id] = {"history": [], "session_id": session_id}
+                print(f"🆕  New session for {user_id}: {session_id}")
+            return self._sessions[user_id]
 
     def _format_history(self, history: list, max_turns: int = 3) -> str:
         """
@@ -1076,23 +1082,25 @@ class SugiCore:
 
     def _load_or_build_bm25(self) -> BM25Retriever:
         cache_path = _ROOT / BM25_CACHE_PATH if not os.path.isabs(BM25_CACHE_PATH) else Path(BM25_CACHE_PATH)
-        count_path = cache_path.with_suffix(".count")
+        hash_path = cache_path.with_suffix(".hash")
 
-        # ── [Fix 2] BM25 cache invalidation based on document count ──────────
-        # If .count sidecar exists, compare stored count with live ChromaDB count.
-        # If new documents were indexed, invalidate cache so BM25 reflects them.
+        # ── [Fix 2] BM25 cache invalidation based on document IDs hash ──────
+        # If .hash sidecar exists, compare stored hash with live ChromaDB ids hash.
+        # This handles subsets/deletions accurately while retaining fast lookup checks.
+        live_ids = vector_store._collection.get(include=[])["ids"]
+        live_hash = hashlib.md5(str(sorted(live_ids)).encode()).hexdigest()
+        
         if cache_path.exists():
             try:
-                live_count = len(vector_store._collection.get(include=[])["ids"])
-                stored_count = int(count_path.read_text()) if count_path.exists() else -1
-                if stored_count == live_count:
-                    print(f"📂  Loading BM25 from cache ({live_count:,} docs, no change)...")
+                stored_hash = hash_path.read_text().strip() if hash_path.exists() else ""
+                if stored_hash == live_hash:
+                    print(f"📂  Loading BM25 from cache (Hash matched)...")
                     with open(cache_path, "rb") as f:
                         return pickle.load(f)
                 else:
-                    print(f"🔄  Dataset changed ({stored_count:,} → {live_count:,} docs) — rebuilding BM25...", flush=True)
+                    print(f"🔄  Dataset changed — rebuilding BM25...", flush=True)
                     cache_path.unlink(missing_ok=True)
-                    count_path.unlink(missing_ok=True)
+                    hash_path.unlink(missing_ok=True)
             except Exception as _e:
                 print(f"⚠️  BM25 cache check error: {_e} — rebuilding.")
                 cache_path.unlink(missing_ok=True)
@@ -1100,7 +1108,7 @@ class SugiCore:
         print("🔨  Building BM25 index...")
         BATCH_SIZE    = 500
         docs_for_bm25 = []
-        all_ids       = vector_store._collection.get(include=[])["ids"]
+        all_ids       = live_ids
         total         = len(all_ids)
         print(f"   Found {total:,} documents...")
 
@@ -1117,8 +1125,8 @@ class SugiCore:
         retriever.k = 4
         with open(cache_path, "wb") as f:
             pickle.dump(retriever, f)
-        # Save doc count for invalidation check on next startup
-        count_path.write_text(str(total))
+        # Save collection hash for invalidation check on next startup
+        hash_path.write_text(live_hash)
         print(f"\n✅  BM25 built ({len(docs_for_bm25):,} docs) and cached.")
         return retriever
 
