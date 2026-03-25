@@ -12,16 +12,17 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 # ─── Configuration ──────────────────────────────────────────────────────────
 from pathlib import Path
 
+from dotenv import load_dotenv
 _ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / "config" / ".env")
+
 DATASET_DIR = str(_ROOT / "data" / "raw_pdfs")
-EMBED_MODEL = "mxbai-embed-large"
+EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────
-# Ganti host/port sesuai setup kamu.
-# Default: server jalan di mesin yang sama (localhost:8000)
 import chromadb as _chromadb
-CHROMA_HOST = "localhost"
-CHROMA_PORT = 8000
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
 # ─── Initialization ─────────────────────────────────────────────────────────

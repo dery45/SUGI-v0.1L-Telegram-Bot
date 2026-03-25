@@ -4,15 +4,34 @@
 
 ```
 Local_RAG_Langchain/
-├── core/
-│   ├── sugi_core.py          ← Core Logic (Shared)
-│   └── user_store.py         ← User Management (Shared)
 ├── config/
-│   └── .env                  ← Central Configuration
-└── interfaces/
-    └── telegram/             ← Telegram Specific Folder
-        ├── telegram_bot.py   ← Entry Point (Run this)
-        └── requirements.txt
+│   ├── .env                      ← Central Configuration
+│   └── settings/
+│       ├── scope_config.ini      ← Allowed/blocked topics
+│       ├── rewriter_config.ini   ← Query rewriting rules
+│       └── plant_keywords.ini    ← Plant name mappings
+├── core/
+│   ├── sugi_core.py              ← Core RAG Logic (Shared)
+│   ├── plant_api.py              ← Perenual API Client
+│   ├── eval_loop.py              ← Answer Quality Scoring
+│   ├── query_logger.py           ← Query Tracing & Debug
+│   └── user_store.py             ← User Management (Shared)
+├── services/
+│   ├── vectorCSV.py              ← CSV/XLSX Watcher & Indexer
+│   ├── vectorpdf.py              ← PDF Watcher & Indexer
+│   ├── vectorWeather.py          ← Weather Data Crawler
+│   └── daily_insight.py          ← MongoDB Insight Cron
+├── interfaces/
+│   └── telegram/
+│       ├── telegram_bot.py       ← Entry Point (Run this)
+│       └── requirements_telegram.txt
+├── data/
+│   ├── db/                       ← ChromaDB storage
+│   ├── raw_dataset/              ← CSV/XLSX source files
+│   ├── raw_pdfs/                 ← PDF source files
+│   └── users.json                ← User profiles
+├── start_all.py                  ← Master Startup Script
+└── requirements.txt
 ```
 
 ---
@@ -20,7 +39,8 @@ Local_RAG_Langchain/
 ## Step 1 — Install Dependencies
 
 ```bash
-pip install -r interfaces/telegram/requirements.txt
+pip install -r requirements.txt
+pip install -r interfaces/telegram/requirements_telegram.txt
 ```
 
 ---
@@ -36,21 +56,47 @@ pip install -r interfaces/telegram/requirements.txt
 
 ## Step 3 — Set the Token & Environment
 
-SUGI uses a `.env` file in the **root directory** for all configurations. Use `.env.example` as a template.
+SUGI uses a `.env` file in `config/` for all configurations. Use `config/.env.example` as a template.
 
 ### Key Environment Variables
 
-- `TELEGRAM_BOT_TOKEN`: The API Token from BotFather.
-- `DEBUG_ALLOWED_USERS`: A comma-separated list of Telegram user IDs (e.g., `123456,789012`). If empty, **all** users can use debug commands (`!debug`, `!session`, etc.). Use this to restrict access in production.
-- `MEMORY_TTL_DAYS`: How many days to keep session summaries in ChromaDB (default: `14`).
-- `SCOPE_CONFIG_PATH`: Path to the `.ini` file defining allowed agricultural topics.
+| Variable | Description | Default |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | API Token from BotFather | *(required)* |
+| `LLM_MODEL` | Main response model | `sugi-v0.1L` |
+| `UTILITY_MODEL` | Utility tasks (rewriting, extraction) | `qwen2.5:1.5b` |
+| `CHROMA_HOST` / `CHROMA_PORT` | ChromaDB server connection | `localhost:8000` |
+| `DEBUG_ALLOWED_USERS` | Restrict `!debug` commands (comma-separated IDs) | *(All)* |
+| `MEMORY_TTL_DAYS` | Days to keep session summaries | `14` |
+| `SCOPE_CONFIG_PATH` | Allowed agricultural topics config | `config/settings/scope_config.ini` |
+| `REWRITER_CONFIG_PATH` | Query rewriting rules config | `config/settings/rewriter_config.ini` |
+| `PLANT_CONFIG_PATH` | Plant detection & mapping config | `config/settings/plant_keywords.ini` |
 
 ---
 
-## Step 4 — Launch the Bot
+## Step 4 — Start ChromaDB Server
+
+ChromaDB must be running before any services can start.
 
 ```bash
-# Ensure your terminal is at the project root (Local_RAG_Langchain)
+# Terminal 1:
+chroma run --path data/db --port 8000
+```
+
+---
+
+## Step 5 — Launch All Services
+
+The recommended way is to use the master startup script, which starts all background services (indexers, weather crawler, insight cron) and the Telegram bot:
+
+```bash
+# Terminal 2:
+python start_all.py
+```
+
+Alternatively, to run **only** the Telegram bot:
+
+```bash
 python interfaces/telegram/telegram_bot.py
 ```
 
@@ -76,10 +122,26 @@ python interfaces/telegram/telegram_bot.py
 - Stores user profiles, phone numbers, and visit statistics.
 - Shared between platforms (CLI and Bot).
 
-**ChromaDB (conversation_memory collection)**:
-- Stores session-based summaries.
-- Queried when users return for context continuity.
-- Managed via `MEMORY_TTL_DAYS` (default active).
+**ChromaDB (4 collections)**:
+- `langchain` — Agricultural document vectors (CSV/XLSX/PDF)
+- `weather_data` — Weather and agronomic data
+- `plant_data` — Plant information from Perenual API
+- `conversation_memory` — Session summaries for context continuity
+
+**MongoDB (`sugi_insights` database)**:
+- Stores daily insights generated by `daily_insight.py`.
+
+---
+
+## INI Configuration Files
+
+All behavior can be customized without code changes via `config/settings/`:
+
+| File | Purpose |
+|---|---|
+| `scope_config.ini` | Define allowed/blocked topic keywords for the scope guard |
+| `rewriter_config.ini` | Referential words, suffixes, followup patterns, topic keywords |
+| `plant_keywords.ini` | Strong/weak plant keywords, plant name → API name mappings |
 
 ---
 
@@ -96,7 +158,7 @@ After=network.target
 [Service]
 WorkingDirectory=/path/to/Local_RAG_Langchain
 EnvironmentFile=/path/to/Local_RAG_Langchain/config/.env
-ExecStart=/path/to/venv/bin/python interfaces/telegram/telegram_bot.py
+ExecStart=/path/to/venv/bin/python start_all.py
 Restart=always
 
 [Install]
@@ -109,5 +171,6 @@ WantedBy=multi-user.target
 
 1. **Debugging Safety**: Always set `DEBUG_ALLOWED_USERS` in production to prevent unauthorized access to query logs and session metadata.
 2. **Context Window**: The system uses `num_ctx=4096` to prevent overflow errors. Ensure your local Ollama model supports this size.
-3. **Embedding Limit**: Documents over 3,000 characters are automatically truncated during storage to fit within the `mxbai-embed-large` 512-token limit.
-4. **Ollama Process**: Ollama must be running as a background service before starting the bot.
+3. **Embedding Limit**: Documents over 2,000 characters are automatically truncated during storage to fit within the `mxbai-embed-large` 512-token limit. Failed embeddings are caught gracefully without crashing the system.
+4. **Scope Guard**: The system uses definitional phrase detection and rewrite-type gating to prevent out-of-scope queries from being incorrectly answered. Only suffix-based rewrites can bypass the initial scope check.
+5. **Ollama Process**: Ollama must be running as a background service before starting the bot.

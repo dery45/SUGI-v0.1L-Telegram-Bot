@@ -23,7 +23,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# ─── Load .env dari config folder ─────────────────────────────────────────────
+# ─── Load .env dari root proyek ───────────────────────────────────────────────
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
 
@@ -57,9 +57,9 @@ UTILITY_MODEL       = os.getenv("UTILITY_MODEL",       "qwen2.5:1.5b")
 CHROMA_HOST         = os.getenv("CHROMA_HOST",         "localhost")
 CHROMA_PORT         = int(os.getenv("CHROMA_PORT",     "8000"))
 BM25_CACHE_PATH     = os.getenv("BM25_CACHE_PATH",     "bm25_cache.pkl")
-SCOPE_CONFIG_PATH   = os.getenv("SCOPE_CONFIG_PATH",   "word_config/scope_config.ini")
-REWRITER_CONFIG_PATH= os.getenv("REWRITER_CONFIG_PATH","word_config/rewriter_config.ini")
-PLANT_CONFIG_PATH   = os.getenv("PLANT_CONFIG_PATH",   "word_config/plant_keywords.ini")
+SCOPE_CONFIG_PATH   = os.getenv("SCOPE_CONFIG_PATH",   "config/settings/scope_config.ini")
+REWRITER_CONFIG_PATH= os.getenv("REWRITER_CONFIG_PATH","config/settings/rewriter_config.ini")
+PLANT_CONFIG_PATH   = os.getenv("PLANT_CONFIG_PATH",   "config/settings/plant_keywords.ini")
 MEMORY_TTL_DAYS     = int(os.getenv("MEMORY_TTL_DAYS", "14"))
 
 _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
@@ -92,10 +92,12 @@ def _load_rewriter_config(path: str) -> tuple[set, set, list, dict]:
 
 
 def _word_match(pattern: str, text: str) -> bool:
-    """Whole-word regex match, case-insensitive."""
+    """Whole-word regex match with Indonesian suffix support."""
     escaped = re.escape(pattern)
+    # Allows common suffixes from scope_config.ini ref-suffixes or similar
+    # nya, mu, ku, lah, kah, pun, kan, i, an
     return bool(re.search(
-        r"(?<![a-zA-Z])" + escaped + r"(?![a-zA-Z])",
+        r"(?<![a-zA-Z])" + escaped + r"(?:nya|mu|ku|lah|kah|pun|kan|i|an)?(?![a-zA-Z])",
         text, re.IGNORECASE
     ))
 
@@ -197,10 +199,15 @@ _ANSWER_TEMPLATE_BASE = (
     "- Hari     : [[NOW_DAY]]\n"
     "- Jam      : [[NOW_TIME]] WIB\n"
     "- Lokasi   : Jakarta, Indonesia\n\n"
+    "Riwayat percakapan (gunakan sebagai konteks untuk pertanyaan lanjutan):\n"
+    "{history}\n\n"
     "Data relevan dari database (pertanian, cuaca, tanaman):\n"
     "{data}\n\n"
     "PANDUAN MENJAWAB:\n"
-    "1. SUMBER DATA\n"
+    "1. SUMBER DATA & KONTEKS\n"
+    "   - Jika pertanyaan merujuk ke jawaban sebelumnya (contoh: 'kenapa pupuk diatas', "
+    "'bagaimana cara merawatnya', 'jelaskan lebih lanjut'), WAJIB gunakan riwayat "
+    "percakapan di atas sebagai referensi utama.\n"
     "   - Jika data berisi informasi cuaca, WAJIB gunakan dan sebut angkanya "
     "(suhu, curah hujan, kelembaban, dll.).\n"
     "   - Jika data berisi informasi harga, sebutkan harga spesifik dan tanggalnya.\n"
@@ -225,7 +232,7 @@ _ANSWER_TEMPLATE_BASE = (
     "   - Gunakan Bahasa Indonesia yang jelas dan mudah dipahami petani.\n"
     "   - Jika user menulis dalam Bahasa Inggris, jawab dalam Bahasa Inggris.\n"
     "   - Nada: ramah tapi profesional. Tidak terlalu formal, tidak terlalu santai.\n\n"
-    "Pertanyaan: {question}"
+    "Pertanyaan saat ini: {question}"
 )
 
 
@@ -250,13 +257,12 @@ class SugiCore:
             temperature    = 0.3,
             repeat_penalty = 1.15,
             keep_alive     = 300,
-            num_ctx        = 4096,   # Pastikan context window cukup besar
         )
         self.rewrite_model = OllamaLLM(
             model       = UTILITY_MODEL,
             temperature = 0,
-            keep_alive  = 0,
-            num_ctx     = 4096,
+            keep_alive  = 120,   # tetap loaded 2 menit — hindari reload tiap query
+            timeout     = 30,    # max 30 detik untuk rewriting, fallback ke original jika timeout
         )
 
         # ── Memory store ──────────────────────────────────────────────────────
@@ -306,23 +312,23 @@ class SugiCore:
         # ── BM25 + Vector retrievers ──────────────────────────────────────────
         print("🔄  Initializing Retrievers...")
         self.bm25_retriever   = self._load_or_build_bm25()
-        self.vector_retriever = vector_store.as_retriever(search_kwargs={"k": 2})
+        self.bm25_retriever.k = 4
+        self.vector_retriever = vector_store.as_retriever(search_kwargs={"k": 4})
         self.primary_ensemble = EnsembleRetriever(
             retrievers = [self.bm25_retriever, self.vector_retriever],
             weights    = [0.5, 0.5],
         )
-        self.bm25_retriever.k = 2
         self.memory_retriever = self.memory_store.as_retriever(search_kwargs={"k": 2})
 
         if self.plant_store:
             self.plant_retriever = self.plant_store.as_retriever(search_kwargs={"k": 3})
         if self.weather_store:
-            self.weather_retriever = self.weather_store.as_retriever(search_kwargs={"k": 4})
+            self.weather_retriever = self.weather_store.as_retriever(search_kwargs={"k": 8})
 
         # ── Reranker ──────────────────────────────────────────────────────────
         print("🧠  Loading Reranker...")
         _reranker = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-        self.compressor = CrossEncoderReranker(model=_reranker, top_n=4)
+        self.compressor = CrossEncoderReranker(model=_reranker, top_n=5)
 
         # ── Config files ──────────────────────────────────────────────────────
         _scope_path = _ROOT / SCOPE_CONFIG_PATH
@@ -387,7 +393,22 @@ class SugiCore:
             # ── [1] Scope check ───────────────────────────────────────────────
             print("🛡️  Checking scope...")
             in_scope = self._is_in_scope(question)
+            
+            history_text = self._format_history(session["history"])
+            has_history  = len(session["history"]) > 0
+
+            # ── [1.1] Query Rewriting ─────────────────────────────────────────
+            standalone_query, rewrite_type = self._maybe_rewrite(question, history_text)
+            
+            if not in_scope and rewrite_type == "suffix":
+                # Only trust suffix-based rewrites (e.g. "menanamnya" → "menanam semangka")
+                # for scope bypass. Word replacements (e.g. "itu" → "musim tanam")
+                # can inject agriculture keywords that weren't in the user's intent.
+                print("   [scope] original failed — checking rewritten (suffix-only)...")
+                in_scope = self._is_in_scope(standalone_query)
+            
             trace["scope_passed"] = in_scope
+            trace["rewritten"]    = standalone_query
 
             if not in_scope:
                 print(f"🚫  Out of scope.")
@@ -395,13 +416,7 @@ class SugiCore:
                 return self.refusal_msg
 
             print("✅  Approved.")
-
-            history_text = self._format_history(session["history"])
-            has_history  = history_text != "No history."
-
-            # ── [1] Query Rewriting ───────────────────────────────────────────
-            standalone_query   = self._maybe_rewrite(question, history_text)
-            trace["rewritten"] = standalone_query
+            print(f"🔍  Query: {standalone_query}")
 
             # ── [2] Plant & Weather detection ─────────────────────────────────
             include_plant   = self._is_plant_query(question, standalone_query)
@@ -420,7 +435,7 @@ class SugiCore:
             # ── [3] Plant API ─────────────────────────────────────────────────
             plant_query_en = None
             if include_plant and self._search_plant_info:
-                plant_query_en = self._extract_and_translate_plant(question)
+                plant_query_en = self._extract_and_translate_plant(standalone_query)
                 if plant_query_en is None:
                     print("🌿  No valid plant name — skipping plant API.")
                     include_plant = False
@@ -444,7 +459,7 @@ class SugiCore:
 
             weather_docs = []
             if include_weather and self.weather_store:
-                weather_docs = self.weather_store.similarity_search(standalone_query, k=4)
+                weather_docs = self.weather_store.similarity_search(standalone_query, k=8)
                 print(f"🌤️  Weather docs: {len(weather_docs)}")
 
             retriever_obj = self._build_retriever(
@@ -463,22 +478,22 @@ class SugiCore:
                     all_docs.append(d)
 
             context = self._format_docs(all_docs) if all_docs else "Tidak ada data relevan di database."
-            if len(context) > 8000:
-                context = context[:8000] + "\n\n[... data truncated for context length ...]"
             print(f"📊  Found {len(all_docs)} chunks "
                   f"({len(weather_docs)} weather + {len(rag_docs)} RAG).")
 
             set_docs(trace, all_docs)
 
             # ── [5] Generate dengan answer template detail ────────────────────
+            print("🤖  Generating answer:\n")
             _live_chain = self._get_answer_prompt() | self.model
-            for chunk in _live_chain.stream({"data": context, "question": standalone_query}):
-                if platform == "cli":
-                    print(chunk, end="", flush=True)
+            for chunk in _live_chain.stream({
+                "data":     context,
+                "question": standalone_query,
+                "history":  history_text,
+            }):
                 full_response += chunk
 
-            if platform == "cli":
-                print("\n")
+            print(full_response)
             trace["answer_preview"] = full_response[:200]
             session["history"].append((question, full_response))
 
@@ -615,29 +630,65 @@ class SugiCore:
     # [1] QUERY REWRITING — internal methods
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def _maybe_rewrite(self, question: str, history_text: str) -> str:
+    # Pola definitional: "apa itu X", "what is X", dll.
+    # "itu" di sini bukan referensial, tapi bagian dari pola definitional.
+    _DEFINITIONAL_PATTERNS = [
+        re.compile(r"^apa\s+itu\b", re.IGNORECASE),
+        re.compile(r"^apakah\s+itu\b", re.IGNORECASE),
+        re.compile(r"^apa\s+yang\s+dimaksud\b", re.IGNORECASE),
+        re.compile(r"^what\s+is\b", re.IGNORECASE),
+        re.compile(r"^what\s+are\b", re.IGNORECASE),
+    ]
+
+    def _maybe_rewrite(self, question: str, history_text: str) -> tuple[str, str]:
         """
         Tiga lapis:
-        1. Rule-based (0ms) — handle 85% kasus
-        2. Qwen LLM fallback (~800ms) — kasus kompleks
-        3. Return original — kalau keduanya gagal
+        1. Fast-path   — pertanyaan sudah self-contained, skip rewriting
+        2. Rule-based  (0ms) — handle 85% kasus referensial
+        3. Qwen LLM fallback (~5-30 detik) — hanya untuk kasus ambigu
+
+        Returns:
+            (rewritten_query, rewrite_type)
+            rewrite_type: "none" | "suffix" | "word" | "followup" | "qwen"
         """
-        if history_text == "No history.":
-            return question
+        if history_text == "Belum ada riwayat percakapan.":
+            return question, "none"
+
+        # ── Fast-path: definitional questions → skip rewriting ─────────────
+        # "apa itu machine learning" → "itu" is NOT referential here
+        q_stripped = question.strip()
+        for pat in self._DEFINITIONAL_PATTERNS:
+            if pat.match(q_stripped):
+                print(f"   [rewrite] definitional question — skipping rewrite")
+                return question, "none"
 
         has_ref     = self._has_referential(question)
         is_followup = self._is_implicit_followup(question)
 
+        # ── Fast-path: tidak ada sinyal referensial → langsung return ──────────
         if not has_ref and not is_followup:
-            return question
+            return question, "none"
+
+        # ── Fast-path: pertanyaan sudah self-contained (punya noun spesifik) ──
+        # Contoh: "apa saja pupuk anorganik yang cocok?" sudah ada "pupuk anorganik"
+        # → tidak perlu rewriting, cukup tambahkan konteks tanaman dari history
+        q_lower = question.lower()
+        all_known = list(self._plant_name_map.keys()) + list(self._topic_kw.keys())
+        question_is_specific = any(_word_match(kw, q_lower) for kw in all_known)
+        if question_is_specific and not has_ref:
+            # Pertanyaan sudah mengandung subjek spesifik, tidak ambigu
+            print(f"   [rewrite] question already specific — skipping rewrite")
+            return question, "none"
 
         subject = self._extract_last_subject(history_text)
         if not subject:
             if has_ref or is_followup:
-                return self._qwen_rewrite(question, history_text)
-            return question
+                # Hanya panggil Qwen jika benar-benar ambigu dan tidak ada subjek
+                return self._qwen_rewrite(question, history_text), "qwen"
+            return question, "none"
 
         q = question
+        rewrite_type = "none"
 
         if has_ref:
             replaced = False
@@ -648,24 +699,29 @@ class SugiCore:
                         subject, q, count=1, flags=re.IGNORECASE,
                     )
                     replaced = True
+                    rewrite_type = "word"
                     break
             if not replaced:
+                old_q = q
                 q = self._resolve_suffix_referential(q, subject)
+                if q != old_q:
+                    rewrite_type = "suffix"
 
         elif is_followup:
-            all_known    = list(self._plant_name_map.keys()) + list(self._topic_kw.keys())
             subject_in_q = any(_word_match(kw, q.lower()) for kw in all_known)
             if not subject_in_q:
                 q = q.rstrip("?").rstrip() + f" {subject}?"
+                rewrite_type = "followup"
 
         if q != question:
             print(f"   [rewrite] rule-based: '{question}' → '{q}'")
-            return q
+            return q, rewrite_type
 
+        # Qwen hanya dipanggil jika rule-based tidak bisa resolve DAN ada sinyal ambigu
         if has_ref or is_followup:
-            return self._qwen_rewrite(question, history_text)
+            return self._qwen_rewrite(question, history_text), "qwen"
 
-        return q
+        return q, rewrite_type
 
     def _has_referential(self, question: str) -> bool:
         q = question.lower().strip()
@@ -715,23 +771,37 @@ class SugiCore:
         return question
 
     def _qwen_rewrite(self, question: str, history_text: str) -> str:
-        print("   [rewrite] rule-based miss → trying Qwen fallback...")
+        """
+        Qwen LLM fallback untuk query rewriting.
+        Dipanggil HANYA jika rule-based tidak bisa resolve.
+        Timeout 30 detik — jika gagal/timeout, return original question.
+        """
+        print("   [rewrite] Qwen fallback (ambiguous query)...")
         try:
-            raw       = self._qwen_rewrite_chain.invoke({"history": history_text, "question": question})
+            raw = self._qwen_rewrite_chain.invoke(
+                {"history": history_text, "question": question}
+            )
             rewritten = raw.strip().split("\n")[0].strip()
             r_lower   = rewritten.lower()
+
             # Validasi: bukan jawaban, max 25 kata, max 1 tanda tanya
             invalid = (
                 len(r_lower.split()) > 25
                 or rewritten.count("?") > 1
                 or any(r_lower.startswith(m) for m in _REWRITE_ANSWER_MARKERS)
+                or not rewritten  # kosong
             )
             if not invalid:
-                print(f"   [rewrite] Qwen: '{question}' → '{rewritten}'")
+                print(f"   [rewrite] Qwen OK: '{question}' → '{rewritten}'")
                 return rewritten
-            print(f"   [rewrite] Qwen output invalid — using original")
+            print(f"   [rewrite] Qwen invalid output — using original")
         except Exception as e:
-            print(f"   [rewrite] Qwen error: {e}")
+            # Tangkap timeout, connection error, dll tanpa crash
+            err_str = str(e)
+            if "timeout" in err_str.lower() or "timed out" in err_str.lower():
+                print(f"   [rewrite] Qwen TIMEOUT — using original question")
+            else:
+                print(f"   [rewrite] Qwen error: {err_str[:80]} — using original")
         return question
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -872,12 +942,22 @@ class SugiCore:
             print(f"🆕  New session for {user_id}: {session_id}")
         return self._sessions[user_id]
 
-    def _format_history(self, history: list, max_turns: int = 2) -> str:
+    def _format_history(self, history: list, max_turns: int = 3) -> str:
+        """
+        Format riwayat percakapan untuk disisipkan ke prompt.
+        - Ambil max_turns giliran terakhir
+        - Truncate jawaban panjang agar tidak memenuhi context window
+        - Jawaban dipotong di 600 karakter agar LLM tetap punya ruang untuk {data}
+        """
         if not history:
-            return "No history."
-        return "\n".join(
-            f"User: {q}\nAssistant: {a}" for q, a in history[-max_turns:]
-        )
+            return "Belum ada riwayat percakapan."
+
+        MAX_ANSWER_CHARS = 600  # potong jawaban panjang — cukup untuk konteks referensial
+        lines = []
+        for q, a in history[-max_turns:]:
+            a_trimmed = a[:MAX_ANSWER_CHARS] + "..." if len(a) > MAX_ANSWER_CHARS else a
+            lines.append(f"User: {q}\nSugi: {a_trimmed}")
+        return "\n\n".join(lines)
 
     def _format_docs(self, docs) -> str:
         return "\n\n".join(doc.page_content for doc in docs)

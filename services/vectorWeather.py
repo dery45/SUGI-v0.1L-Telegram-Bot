@@ -35,16 +35,21 @@ from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 
+from dotenv import load_dotenv
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(_ROOT / "config" / ".env")
+
 # ─── Configuration ────────────────────────────────────────────────────────────
-EMBED_MODEL    = "mxbai-embed-large"
+EMBED_MODEL    = os.getenv("EMBED_MODEL", "mxbai-embed-large")
+LATITUDE       = float(os.getenv("LATITUDE", "-6.1818"))
+LONGITUDE      = float(os.getenv("LONGITUDE", "106.8223"))
+LOCATION_NAME  = os.getenv("LOCATION_NAME", "Jakarta")
 
-LATITUDE       = -6.1818
-LONGITUDE      = 106.8223
-LOCATION_NAME  = "Jakarta"
-
-PAST_DAYS      = 92
-FORECAST_DAYS  = 16
-CHECK_INTERVAL = 300
+PAST_DAYS      = int(os.getenv("PAST_DAYS", "92"))
+FORECAST_DAYS  = int(os.getenv("FORECAST_DAYS", "16"))
+CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "300"))
 
 HOURLY_VARS = [
     "temperature_2m",

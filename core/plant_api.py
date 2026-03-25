@@ -191,18 +191,22 @@ def _store_docs(documents: list[Document]):
         return
     from datetime import datetime as _dt
     now_iso = _dt.now().isoformat()
-    # Inject cached_at dan truncating content agar tidak melebih context embedding (512 tokens)
+    # Inject cached_at dan truncating content agar tidak melebih context embedding (512 tokens ≈ 2000 chars)
     for doc in documents:
         doc.metadata["cached_at"] = now_iso
-        if len(doc.page_content) > 3000:
-            doc.page_content = doc.page_content[:3000] + "..."
+        if len(doc.page_content) > 2000:
+            doc.page_content = doc.page_content[:2000] + "..."
+    
     ids      = [doc.id for doc in documents]
-    existing = plant_store.get(ids=ids)["ids"]
-    new_docs = [d for d in documents if d.id not in existing]
-    new_ids  = [d.id for d in new_docs]
-    if new_docs:
-        plant_store.add_documents(documents=new_docs, ids=new_ids)
-        print(f"   💾 Stored {len(new_docs)} new plant docs to ChromaDB (cached_at: {now_iso}).")
+    try:
+        existing = plant_store.get(ids=ids)["ids"]
+        new_docs = [d for d in documents if d.id not in existing]
+        new_ids  = [d.id for d in new_docs]
+        if new_docs:
+            plant_store.add_documents(documents=new_docs, ids=new_ids)
+            print(f"   💾 Stored {len(new_docs)} new plant docs to ChromaDB (cached_at: {now_iso}).")
+    except Exception as e:
+        print(f"   ⚠️  Plant store add error: {e}")
 
 
 # ─── API 1: Species search + details ─────────────────────────────────────────
