@@ -477,6 +477,27 @@ class SugiCore:
                     seen.add(key)
                     all_docs.append(d)
 
+            # ── [Fix 1] Inject long-term memory docs for returning users ──────
+            # Memory docs are prepended (low priority) to give the LLM past
+            # conversation context while keeping the retrieval signal dominant.
+            if has_history:
+                try:
+                    mem_docs = self.memory_store.similarity_search(
+                        standalone_query, k=2,
+                        filter={"user_id": user_id}
+                    )
+                    new_mem = [
+                        d for d in mem_docs
+                        if hash(d.page_content[:120]) not in seen
+                    ]
+                    if new_mem:
+                        for d in new_mem:
+                            seen.add(hash(d.page_content[:120]))
+                        all_docs = new_mem + all_docs   # memory first
+                        print(f"💾  Injected {len(new_mem)} memory doc(s) from long-term store.")
+                except Exception as _mem_err:
+                    print(f"   ⚠️  Memory recall error: {_mem_err}")
+
             context = self._format_docs(all_docs) if all_docs else "Tidak ada data relevan di database."
             print(f"📊  Found {len(all_docs)} chunks "
                   f"({len(weather_docs)} weather + {len(rag_docs)} RAG).")
@@ -496,6 +517,9 @@ class SugiCore:
             print(full_response)
             trace["answer_preview"] = full_response[:200]
             session["history"].append((question, full_response))
+            # ── [Fix 3] Cap history list at 20 turns to prevent RAM bloat ────
+            if len(session["history"]) > 20:
+                session["history"] = session["history"][-20:]
 
             # Simpan memory setiap 5 pertanyaan
             if len(session["history"]) % 5 == 0:
@@ -847,6 +871,20 @@ class SugiCore:
     # [3] PLANT API — internal methods
     # ═══════════════════════════════════════════════════════════════════════════
 
+    # Common non-plant words that Qwen sometimes returns as plant names
+    _QWEN_PLANT_BLOCKLIST = {
+        # Seasons / time
+        "spring", "summer", "fall", "winter", "autumn", "season", "monsoon",
+        # Weather
+        "rain", "sun", "light", "water", "soil", "land", "air", "earth",
+        # Generic nouns
+        "plant", "tree", "crop", "seed", "fruit", "leaf", "root", "flower",
+        "grain", "vegetable", "herb", "shrub", "bush", "weed", "grass",
+        "food", "farm", "field", "garden", "nature", "agriculture", "harvest",
+        # Error-like outputs
+        "none", "n/a", "not applicable", "unknown", "no plant",
+    }
+
     def _extract_and_translate_plant(self, question: str) -> str | None:
         q = question.lower()
         for kw in sorted(self._plant_name_map.keys(), key=len, reverse=True):
@@ -863,6 +901,9 @@ class SugiCore:
                 or not plant_name
                 or len(plant_name.split()) > 4
                 or any(w in plant_name for w in ["question", "answer", "->", ":"])
+                or plant_name in self._QWEN_PLANT_BLOCKLIST
+                or any(plant_name == bl or plant_name.startswith(bl + " ")
+                       for bl in self._QWEN_PLANT_BLOCKLIST)
             )
             if not invalid:
                 print(f"   [plant-map] Qwen: '{plant_name}'")
@@ -1035,10 +1076,26 @@ class SugiCore:
 
     def _load_or_build_bm25(self) -> BM25Retriever:
         cache_path = _ROOT / BM25_CACHE_PATH if not os.path.isabs(BM25_CACHE_PATH) else Path(BM25_CACHE_PATH)
+        count_path = cache_path.with_suffix(".count")
+
+        # ── [Fix 2] BM25 cache invalidation based on document count ──────────
+        # If .count sidecar exists, compare stored count with live ChromaDB count.
+        # If new documents were indexed, invalidate cache so BM25 reflects them.
         if cache_path.exists():
-            print(f"📂  Loading BM25 from cache...")
-            with open(cache_path, "rb") as f:
-                return pickle.load(f)
+            try:
+                live_count = len(vector_store._collection.get(include=[])["ids"])
+                stored_count = int(count_path.read_text()) if count_path.exists() else -1
+                if stored_count == live_count:
+                    print(f"📂  Loading BM25 from cache ({live_count:,} docs, no change)...")
+                    with open(cache_path, "rb") as f:
+                        return pickle.load(f)
+                else:
+                    print(f"🔄  Dataset changed ({stored_count:,} → {live_count:,} docs) — rebuilding BM25...", flush=True)
+                    cache_path.unlink(missing_ok=True)
+                    count_path.unlink(missing_ok=True)
+            except Exception as _e:
+                print(f"⚠️  BM25 cache check error: {_e} — rebuilding.")
+                cache_path.unlink(missing_ok=True)
 
         print("🔨  Building BM25 index...")
         BATCH_SIZE    = 500
@@ -1060,6 +1117,8 @@ class SugiCore:
         retriever.k = 4
         with open(cache_path, "wb") as f:
             pickle.dump(retriever, f)
+        # Save doc count for invalidation check on next startup
+        count_path.write_text(str(total))
         print(f"\n✅  BM25 built ({len(docs_for_bm25):,} docs) and cached.")
         return retriever
 
