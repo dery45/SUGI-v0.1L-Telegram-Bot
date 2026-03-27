@@ -71,6 +71,40 @@ def main():
     print("          Sugi v0.1L Master Startup Script        ")
     print("==================================================")
 
+    import urllib.request
+    import urllib.error
+    import time
+    print("⏳ Waiting for ChromaDB to be ready on port 8000...")
+    chroma_ready = False
+    for _ in range(30):
+        try:
+            req = urllib.request.Request("http://127.0.0.1:8000/api/v1", method="GET")
+            urllib.request.urlopen(req, timeout=1)
+            chroma_ready = True
+            break
+        except urllib.error.HTTPError:
+            # Server responded but returned HTTP error (e.g., 404, 501) - meaning it is online!
+            chroma_ready = True
+            break
+        except Exception:
+            try:
+                req2 = urllib.request.Request("http://localhost:8000/api/v1", method="GET")
+                urllib.request.urlopen(req2, timeout=1)
+                chroma_ready = True
+                break
+            except urllib.error.HTTPError:
+                chroma_ready = True
+                break
+            except Exception:
+                pass
+        time.sleep(1)
+        
+    if not chroma_ready:
+        print("❌ ChromaDB not reachable after 30 seconds. Exiting...")
+        sys.exit(1)
+        
+    print("✅ ChromaDB is ready!")
+
     mgr = ServiceManager()
 
     # 1. Start Vector CSV/XLSX Service

@@ -32,6 +32,7 @@ import hashlib
 import traceback
 from datetime import datetime, timezone
 from typing import Any
+import concurrent.futures
 
 # ── Env loading ───────────────────────────────────────────────────────────────
 try:
@@ -197,7 +198,7 @@ def generate_price_insights() -> list[dict]:
     minta LLM buat ringkasan insight per grup.
     """
     print("\n💰  Generating price insights...")
-    docs = _fetch_all_docs("langchain")    # koleksi utama hasil vectorCSV
+    docs = _fetch_all_docs("main_dataset")    # koleksi utama hasil vectorCSV
 
     # Filter dokumen bertipe harga
     price_keywords = {"harga", "price", "komoditas", "pasar", "rp", "rupiah", "kg", "ton"}
@@ -218,7 +219,8 @@ def generate_price_insights() -> list[dict]:
         groups.setdefault(prov, []).append(d["text"])
 
     results = []
-    for province, texts in groups.items():
+
+    def _process_group(province, texts):
         combined = "\n".join(texts[:10])    # ambil 10 chunk per grup
         prompt = (
             f"Kamu adalah analis pertanian Indonesia. "
@@ -230,14 +232,16 @@ def generate_price_insights() -> list[dict]:
             f"Insight:"
         )
         insight = _ask_llm(prompt, fallback=f"Data harga tersedia untuk {province}: {combined[:300]}")
-        doc = _base_doc(
+        return _base_doc(
             category  = "price_insight",
             text      = combined,
             province  = province,
             insight   = insight,
             doc_count = len(texts),
         )
-        results.append(doc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(lambda item: _process_group(*item), groups.items()))
 
     print(f"   📊  {len(results)} price insights dari {len(price_docs)} dokumen.")
     return results
@@ -268,7 +272,8 @@ def generate_weather_insights() -> list[dict]:
         groups.setdefault(loc, []).append(d["text"])
 
     results = []
-    for location, texts in groups.items():
+
+    def _process_weather_group(location, texts):
         combined = "\n".join(texts[:8])
         prompt = (
             f"Kamu adalah konsultan cuaca pertanian. "
@@ -280,14 +285,16 @@ def generate_weather_insights() -> list[dict]:
             f"Insight:"
         )
         insight = _ask_llm(prompt, fallback=f"Data cuaca tersedia untuk {location}: {combined[:300]}")
-        doc = _base_doc(
+        return _base_doc(
             category  = "weather_insight",
             text      = combined,
             location  = location,
             insight   = insight,
             doc_count = len(texts),
         )
-        results.append(doc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(lambda item: _process_weather_group(*item), groups.items()))
 
     print(f"   🌦️   {len(results)} weather insights dari {len(docs)} dokumen.")
     return results
@@ -314,7 +321,7 @@ def generate_planting_suggestions() -> list[dict]:
     dan musim tanam saat ini.
     """
     print("\n🌱  Generating planting suggestions...")
-    docs = _fetch_all_docs("langchain")
+    docs = _fetch_all_docs("main_dataset")
 
     budidaya_keywords = {
         "tanam", "semai", "bibit", "benih", "varietas",
@@ -328,7 +335,7 @@ def generate_planting_suggestions() -> list[dict]:
     musim_sekarang = _MUSIM_MAP.get(NOW_UTC.month, "Tidak Diketahui")
     results        = []
 
-    for komoditas in _KOMODITAS_UTAMA:
+    def _process_planting_group(komoditas):
         relevant = [
             d["text"] for d in budidaya_docs
             if komoditas.lower() in d["text"].lower()
@@ -349,7 +356,7 @@ def generate_planting_suggestions() -> list[dict]:
             prompt,
             fallback=f"Saran tanam {komoditas} untuk {musim_sekarang}: data terbatas di database."
         )
-        doc = _base_doc(
+        return _base_doc(
             category       = "planting_suggestion",
             text           = combined,
             komoditas      = komoditas,
@@ -358,7 +365,9 @@ def generate_planting_suggestions() -> list[dict]:
             insight        = insight,
             data_available = len(relevant) > 0,
         )
-        results.append(doc)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(_process_planting_group, _KOMODITAS_UTAMA))
 
     print(f"   🌾  {len(results)} planting suggestions ({musim_sekarang}).")
     return results
@@ -372,7 +381,7 @@ def generate_general_insights() -> list[dict]:
     buat 3-5 insight tren/topik terpenting hari ini.
     """
     print("\n📰  Generating general insights...")
-    docs = _fetch_all_docs("langchain")
+    docs = _fetch_all_docs("main_dataset")
 
     policy_keywords = {
         "kebijakan", "regulasi", "subsidi", "program", "bantuan",

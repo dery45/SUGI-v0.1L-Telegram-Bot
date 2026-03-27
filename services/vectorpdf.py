@@ -28,6 +28,7 @@ _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 # ─── Initialization ─────────────────────────────────────────────────────────
 embeddings   = OllamaEmbeddings(model=EMBED_MODEL)
 vector_store = Chroma(
+    collection_name="main_dataset",  # intentionally shared with vectorCSV
     client=_chroma_client,
     embedding_function=embeddings
 )

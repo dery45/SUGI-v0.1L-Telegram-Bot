@@ -76,8 +76,8 @@ HOURLY_VARS = [
 # Ganti host/port sesuai setup kamu.
 # Default: server jalan di mesin yang sama (localhost:8000)
 import chromadb as _chromadb
-CHROMA_HOST = "localhost"
-CHROMA_PORT = 8000
+CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.getenv("CHROMA_PORT", "8000"))
 _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 
 _embeddings   = OllamaEmbeddings(model=EMBED_MODEL)

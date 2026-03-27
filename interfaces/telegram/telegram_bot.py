@@ -62,6 +62,7 @@ class SugiTelegramBot:
             )
         self.sugi  = SugiCore()
         self.users = UserStore()
+        self._last_request: dict[str, float] = {}
         print("🤖  Sugi Telegram Bot initialized.")
 
     # ── /start ────────────────────────────────────────────────────────────────
@@ -211,9 +212,16 @@ class SugiTelegramBot:
 
     # ── Handle pesan teks biasa ───────────────────────────────────────────────
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        import time
         user     = update.effective_user
         user_id  = str(user.id)
         question = update.message.text.strip()
+        
+        now = time.time()
+        if user_id in self._last_request and now - self._last_request[user_id] < 3.0:
+            await update.message.reply_text("⏳ Harap tunggu beberapa detik sebelum bertanya lagi.")
+            return
+        self._last_request[user_id] = now
 
         self.users.get_or_create(
             user_id   = user_id,

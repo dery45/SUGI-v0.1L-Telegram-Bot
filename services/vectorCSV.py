@@ -83,6 +83,7 @@ def _get_splitter(data_type: str) -> RecursiveCharacterTextSplitter:
 # ─── Initialization ─────────────────────────────────────────────────────────
 embeddings   = OllamaEmbeddings(model=EMBED_MODEL)
 vector_store = Chroma(
+    collection_name="main_dataset",
     client=_chroma_client,
     embedding_function=embeddings
 )
