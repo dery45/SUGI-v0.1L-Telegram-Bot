@@ -1,6 +1,5 @@
 # 🌾 SUGI v0.1L – Intelligent Agricultural Assistant (Indonesia)
 
-**S**ystem **U**tama **G**enerative **I**ntelijen  
 An AI-powered RAG assistant specifically designed for farmers, growers, government officials, and agribusiness players in Indonesia & Southeast Asia.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
@@ -10,6 +9,25 @@ An AI-powered RAG assistant specifically designed for farmers, growers, governme
 [![MongoDB](https://img.shields.io/badge/MongoDB-Daily%20Insights-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
 ![Score](https://img.shields.io/badge/RAG%20Score-93%2F100-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
+
+## 📱 Live Demo
+
+You can try the SUGI AI chatbot live on Telegram:
+👉 **[Chat with @sugi_demo_llmbot on Telegram](https://t.me/sugi_demo_llmbot)**
+
+<p align="center">
+  <img src="image/QR-Link-to-try-sugiai.png" width="220" alt="QR Link to try SUGI AI">
+</p>
+
+## 📸 Interface Previews
+
+Here is SUGI AI in action on Telegram:
+
+<p align="center">
+  <img src="image/chatbot-answer-1.png" width="32%" alt="Chatbot Answer Example 1" />
+  <img src="image/chatbot-answer-2.png" width="32%" alt="Chatbot Answer Example 2" />
+  <img src="image/chatbot-answer-when-offline.png" width="32%" alt="Chatbot Answer Offline Mode" />
+</p>
 
 ## 🔥 Main Features
 
@@ -36,7 +54,7 @@ An AI-powered RAG assistant specifically designed for farmers, growers, governme
 
 | Component | Detail |
 |---|---|
-| **Primary LLM** | Llama 3.2 fine-tuned → `sugi-v0.1L` (via Ollama) |
+| **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama) |
 | **Utility Model** | `qwen2.5:1.5b` — query rewriting fallback, plant extraction, eval loop, insights |
 | **Embedding** | `mxbai-embed-large` |
 | **Vector Store** | ChromaDB Server mode — 4 collections: `langchain`, `weather_data`, `plant_data`, `conversation_memory` |
@@ -146,4 +164,4 @@ SUGI-v0.1L/
 ## License
 MIT License.
 
-Last updated: March 2026 · v0.1L (Scope-Hardened) · RAG Score 93/100
+Last updated: June 2026 · v0.1L (Scope-Hardened) · RAG Score 93/100
