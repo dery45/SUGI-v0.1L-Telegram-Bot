@@ -48,6 +48,7 @@ Here is SUGI AI in action on Telegram:
 - **Long-term Memory** → Session summaries stored in ChromaDB for multi-turn context  
 - **Daily Insight Engine** → Sends daily insights to MongoDB every 12 hours (regional prices, weather, planting tips, policies).
 - **Government Insight Engine** → AI-generated strategic insights from 14 government datasets (prices, food security, distribution) with ChromaDB learning loop. Polls every 3600s.
+- **Farmer Insight Engine** → 10 AI-generated farmer insights (Skor PPH, Komoditas Terbaik, Margin Positif, Surplus Pangan, Peluang Bulanan, Rekomendasi Tanam/Jual, dll.) + 1 Government Policy Recommendation. Uses example-driven prompting, multi-stage validation (Bahasa Indonesia, no truncation, no prefixes), retry on failure, and full SUGI ecosystem enrichment (RAG, weather, plant API, ChromaDB memory). Change detection with daily refresh.
 - **INI-based Configuration** → All keywords & plant maps in `config/settings/`, no code changes needed.
 - **Scope Guard** → Only answers agriculture & plantation related topics.  
 - **Offline Message Catch-up** → Telegram bot processes messages sent while offline on restart, with crash-safe offset persistence.
@@ -61,7 +62,7 @@ Here is SUGI AI in action on Telegram:
 | **Embedding** | `mxbai-embed-large` (Ollama) |
 | **Vector Store** | ChromaDB Server mode — 4 collections |
 | **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=5, k=2-8) |
-| **Insight DB** | MongoDB Atlas — 6 collections in `sugi_insights` database + `test.governmentinsights` (write-only) |
+| **Insight DB** | MongoDB Atlas — 7 collections across `sugi_insights` + `test` databases (write-only) |
 | **External APIs** | Open-Meteo (Free weather), Perenual (Plants & Pests) |
 | **Framework** | LangChain, LangChain-Classic |
 
@@ -78,10 +79,10 @@ Here is SUGI AI in action on Telegram:
 | `plant_data` | Per-plant cache | `plant_api.py` | Plant query → Perenual API fetch | Plant query detected → `similarity_search(k=3)` | `{source, cache_key, plant_id?, common_name?, image_url?, cached_at, page_content}` |
 | `conversation_memory` | Per-user session summaries | `sugi_core.py` | Every 5 user questions → LLM-summarized | Every query (filter by user_id, k=2) + memory recall | `{source, user_id, session_id, timestamp, page_content}` |
 
-### MongoDB (2 databases, 6 collections — WRITE only)
+### MongoDB (2 databases, 7 collections — WRITE only)
 
 `sugi_insights` database written every 12 hours by `daily_insight.py`.  
-`test.governmentinsights` written every 3600s by `government_insight_service.py`.  
+`test.governmentinsights` + `test.farmerinsights` written by `government_insight_service.py` and `farmer_insight_service.py`.  
 **Zero reads** from the application — data is consumed by external dashboards.
 
 | Database | Collection | Doc Count | Service | Content |
@@ -91,7 +92,8 @@ Here is SUGI AI in action on Telegram:
 | `sugi_insights` | `planting_suggestions` | ~400 | `daily_insight.py` | LLM-generated planting recommendations per commodity × season |
 | `sugi_insights` | `general_insights` | ~45 | `daily_insight.py` | Top 3-5 policy/trend insights from kebijakan docs |
 | `sugi_insights` | `session_summaries` | ~13 | `daily_insight.py` | Conversation session summaries from conversation_memory |
-| `sugi_insights` / `test` | `governmentinsights` | ~14 | `government_insight_service.py` | LLM-generated strategic insights per government dataset collection |
+| `sugi_insights` / `test` | `governmentinsights` | ~15 | `government_insight_service.py` + `farmer_insight_service.py` | Per-collection insights + 1 policy recommendation |
+| `sugi_insights` / `test` | `farmerinsights` | ~10 | `farmer_insight_service.py` | 10 farmer-focused market insights (pph_score, best_commodity, margin_status, etc.) |
 
 ### Local Files
 
@@ -284,13 +286,14 @@ chroma run --path data/db --port 8000
 ```bash
 python start_all.py
 ```
-This starts 6 background processes with auto-restart:
+This starts 7 background processes with auto-restart:
 1. CSV/XLSX Watcher (`vectorCSV.py`)
 2. PDF Watcher (`vectorpdf.py`)
 3. Weather Service (`vectorWeather.py`)
 4. Daily Insight Cron (`daily_insight.py`)
 5. Government Insight Engine (`government_insight_service.py`)
-6. Telegram Bot (`telegram_bot.py`)
+6. Farmer Insight Engine (`farmer_insight_service.py`)
+7. Telegram Bot (`telegram_bot.py`)
 
 **Alternative — CLI only:**
 ```bash
@@ -362,6 +365,16 @@ SUGI-v0.1L/
 │       ├── ChromaDB learning loop (government_memory collection)
 │       ├── SUGI ecosystem context (RAG + weather + past insights)
 │       └── Monthly full refresh at 30 days
+│   ├── farmer_insight_service.py     # Farmer Insights & Policy Recommendation Engine
+│       ├── 10 farmer market insights (≤150 chars each, saved to farmerinsights)
+│       ├── 1 Government Policy Recommendation (400-500 chars, saved to governmentinsights)
+│       ├── Data change detection with selective regeneration
+│       ├── Multi-stage validation: no brackets, no truncation, Bahasa Indonesia only
+│       ├── Automatic retry on validation failure (up to 3 attempts)
+│       ├── Example-driven prompting for concise, data-first insight style
+│       ├── ChromaDB learning loop (insights_memory collection)
+│       ├── SUGI ecosystem enrichment (RAG, weather, plant API, historical memory)
+│       └── Daily automatic refresh + change-triggered regeneration
 ├── interfaces/                      # User-Facing Entry Points
 │   ├── cli/
 │   │   └── main.py                  # Terminal chat client (persistent user ID)

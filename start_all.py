@@ -119,6 +119,8 @@ def main():
     mgr.add("Telegram Bot",          [sys.executable, str(Path("interfaces/telegram/telegram_bot.py"))])
     # 6. Start Government Insight Engine
     mgr.add("Government Insight",    [sys.executable, str(Path("services/government_insight_service.py"))])
+    # 7. Start Farmer Insights & Policy Recommendation Engine
+    mgr.add("Farmer Insight Engine", [sys.executable, str(Path("services/farmer_insight_service.py"))])
 
     print("\n✅ All background services initiated! (Press Ctrl+C to stop all)")
     print("   Note: Ensure 'chroma run --path data/db --port 8000' is running in a separate terminal!")
