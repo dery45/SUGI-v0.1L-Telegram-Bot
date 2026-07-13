@@ -117,6 +117,8 @@ def main():
     mgr.add("Daily Insight Cron",    [sys.executable, str(Path("services/daily_insight.py"))])
     # 5. Start Telegram Bot
     mgr.add("Telegram Bot",          [sys.executable, str(Path("interfaces/telegram/telegram_bot.py"))])
+    # 6. Start Government Insight Engine
+    mgr.add("Government Insight",    [sys.executable, str(Path("services/government_insight_service.py"))])
 
     print("\n✅ All background services initiated! (Press Ctrl+C to stop all)")
     print("   Note: Ensure 'chroma run --path data/db --port 8000' is running in a separate terminal!")
