@@ -7,7 +7,7 @@ An AI-powered RAG assistant specifically designed for farmers, growers, governme
 [![LangChain](https://img.shields.io/badge/LangChain-RAG-orange)](https://python.langchain.com/)
 [![ChromaDB](https://img.shields.io/badge/VectorDB-ChromaDB%20Server-purple)](https://www.trychroma.com/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-Daily%20Insights-47A248?logo=mongodb&logoColor=white)](https://www.mongodb.com/)
-![Score](https://img.shields.io/badge/RAG%20Score-93%2F100-brightgreen)
+![Score](https://img.shields.io/badge/RAG%20Score-94%2F100-brightgreen)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## 📱 Live Demo
@@ -460,7 +460,7 @@ python test_mongo.py
 
 ---
 
-## RAG Score: 93/100
+## RAG Score: 94/100
 
 Evaluated on:
 - **Faithfulness**: Answer stays within retrieved context
@@ -468,10 +468,11 @@ Evaluated on:
 - **Scope Accuracy**: Correctly blocks out-of-scope queries
 - **Rewrite Quality**: Rule-based handles 85% of referential cases
 - **Latency**: Average <5s per query (BM25 cache + streaming generation)
+- **Ecosystem Integration**: Insight engines enrich context with government & farmer analytics via ChromaDB learning loop
 
 ---
 
 ## License
 MIT License.
 
-Last updated: July 2026 · v0.1L (Scope-Hardened) · RAG Score 93/100
+Last updated: July 2026 · v0.1L (Scope-Hardened) · RAG Score 94/100
