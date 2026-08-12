@@ -19,9 +19,10 @@ Legend for source of each entry:
 
 ---
 
-## Unreleased — `v0.2.0` (work in progress, working tree @ 2026-08-12)
+## `v0.2.0` — 2026-08-12 — Optimization, latency & correctness hardening [git]
 
-**Status:** uncommitted changes on top of `cd6f42b`. [inferred]
+**Status:** committed & pushed to `origin/main` as `f53db8e`
+("v0.2.0 Improve optimization and faster perfomance and responses").
 
 ### Summary
 Performance, latency, and correctness hardening of the RAG / eval pipeline,
@@ -372,6 +373,7 @@ Modelfile, document ingestion and question generation.
 ## Git history index (commit → version, reconstructed)
 
 ```
+2026-08-12  f53db8e                       → v0.2.0
 2026-07-13  cd6f42b / 6fb410c / cc94e4c  → v0.1.9
 2026-06-03  d8b10fa                       → v0.1.8
 2026-04-13  d8245b1                       → v0.1.7

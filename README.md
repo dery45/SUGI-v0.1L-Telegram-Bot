@@ -494,11 +494,11 @@ Evaluated on:
 
 > Full details live in: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (detailed chronological changelog — the **only** tracked file in `docs/`; the rest is internal-only) and [`docs/VERSIONS.md`](docs/VERSIONS.md) (concise overview, git-ignored).
 
-**Current status:** v0.2.0 (work in progress — working tree @ Aug 2026) · committed HEAD `cd6f42b`
+**Current status:** v0.2.0 (committed & pushed — HEAD `f53db8e`, 2026-08-12)
 
 | Version | Date | Status | Summary |
 |---|---|---|---|
-| **v0.2.0** | 2026-08 | ⏳ Working tree | Background eval (daemon thread), model residency `keep_alive=600`, eval stability (`num_ctx`/`num_predict`/timeout), parallel plant-detail fetch, scope-guard fix for `penanaman`, README DB schema (6 ChromaDB collections), `docs/CHANGELOG.md` changelog added & tracked, `tests/` git-ignored, A9 multi-turn history-poisoning fix, A8 insight-engine startup stagger (180/240/300s) + 240s LLM timeout, A10 retrieval-level memory gating + A4 closure (unfiltered `memory_retriever` removed), A11 startup-429 NameError fix + single-pass rerank + dead `include_weather`/`weather_retriever` removal + eval `num_predict=10`, A12 daily_insight concurrency backfill (pools → sequential `_run_paced` + `INSIGHT_LLM_DELAY`, `DAILY_INSIGHT_MAX_WORKERS` env) + A7 ping-retry (`_ping_with_retry` 5s/10s) |
+| **v0.2.0** | 2026-08-12 | ✔ Committed (`f53db8e`) | Background eval (daemon thread), model residency `keep_alive=600`, eval stability (`num_ctx`/`num_predict`/timeout), parallel plant-detail fetch, scope-guard fix for `penanaman`, README DB schema (6 ChromaDB collections), `docs/CHANGELOG.md` changelog added & tracked, `tests/` git-ignored, A9 multi-turn history-poisoning fix, A8 insight-engine startup stagger (180/240/300s) + 240s LLM timeout, A10 retrieval-level memory gating + A4 closure (unfiltered `memory_retriever` removed), A11 startup-429 NameError fix + single-pass rerank + dead `include_weather`/`weather_retriever` removal + eval `num_predict=10`, A12 daily_insight concurrency backfill (pools → sequential `_run_paced` + `INSIGHT_LLM_DELAY`, `DAILY_INSIGHT_MAX_WORKERS` env) + A7 ping-retry (`_ping_with_retry` 5s/10s) |
 | **v0.1.9** | 2026-07-13 | ✔ Committed | Government & Farmer Insight Engines (+ChromaDB `government_memory`/`insights_memory`, MongoDB output) |
 | **v0.1.8** | 2026-06-03 | ✔ Committed | README/docs refresh + demo screenshots |
 | **v0.1.7** | 2026-04-13 | ✔ Committed | Telegram offline message catch-up, crash-safe offset persistence |
