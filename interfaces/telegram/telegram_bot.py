@@ -470,6 +470,9 @@ class SugiTelegramBot:
             self._keep_typing(update.effective_chat.id, context.bot, stop_typing)
         )
 
+        # D1: bandingkan waktu ask() di dalam SugiCore vs waktu wrapper
+        # Telegram — untuk membedakan bottleneck generasi vs pengiriman.
+        _tg_start = time.monotonic()
         try:
             response = await asyncio.to_thread(
                 self.sugi.ask,
@@ -480,6 +483,7 @@ class SugiTelegramBot:
         finally:
             stop_typing.set()
             await typing_task
+        print(f"[TIMING] Telegram to_thread(ask) awaited {time.monotonic() - _tg_start:.2f}s")
 
         await self._send_long(update, response)
 

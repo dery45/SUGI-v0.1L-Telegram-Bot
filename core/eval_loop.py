@@ -5,7 +5,17 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # ─── Eval LLM (Qwen2.5-1.5B — lebih kecil dari phi3, lebih baik Indonesia) ─────
-_eval_model = OllamaLLM(model="qwen2.5:1.5b", temperature=0, num_ctx=4096)
+# keep_alive disamakan dgn model lain (C2: residensi). Timeout request dipasang
+# lewat client_kwargs — di langchain-ollama 1.0.1 `timeout=` bukan kwarg OllamaLLM
+# dan akan diserap *args secara diam-diam (C1: defense-in-depth thd hang thread).
+_eval_model = OllamaLLM(
+    model="qwen2.5:1.5b",
+    temperature=0,
+    num_ctx=4096,
+    keep_alive=600,
+    num_predict=10,  # cap output: hanya perlu 1 kata (HIGH/MEDIUM/LOW) — konsisten dgn model utilitas lain
+    client_kwargs={"timeout": 15},
+)
 
 _FAITHFULNESS_PROMPT = ChatPromptTemplate.from_template("""
 You are evaluating an AI answer for faithfulness.

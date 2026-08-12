@@ -44,7 +44,7 @@ if not MONGO_URI:
 
 import certifi
 from pymongo import MongoClient, ReplaceOne
-from pymongo.errors import PyMongoError
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
@@ -55,6 +55,11 @@ from langchain_core.documents import Document
 # ─────────────────────────────────────────────────────────────────────────────
 
 POLL_INTERVAL = int(os.getenv("GOV_INSIGHT_INTERVAL", "3600"))
+INSIGHT_LLM_DELAY = float(os.getenv("INSIGHT_LLM_DELAY", "1"))
+STARTUP_GRACE_SECONDS = int(os.getenv(
+    "GOVERNMENT_INSIGHT_GRACE_SECONDS",
+    os.getenv("STARTUP_GRACE_SECONDS", "240"),
+))
 MONTHLY_REFRESH_DAYS = 30
 INSIGHT_MIN_CHARS = 400
 INSIGHT_MAX_CHARS = 500
@@ -128,6 +133,27 @@ def _ask_llm(llm: OllamaLLM, prompt: str) -> str:
         return ""
 
 
+def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
+    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
+
+    Atlas kadang transient "No primary found" saat pemilihan topologi baru
+    selesai (ServerSelectionTimeoutError). Dulu __init__ ping sekali tanpa
+    retry dan hanya mengandalkan restart proses luar di start_all.py — ini
+    menambahkan lapisan retry di dalam service sendiri.
+    """
+    for attempt in range(attempts):
+        try:
+            mongo.admin.command("ping")
+            return
+        except ServerSelectionTimeoutError as e:
+            if attempt == attempts - 1:
+                raise
+            wait = base_wait * (attempt + 1)
+            print(f"  GovInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
+                  f"retrying in {wait}s: {e}")
+            time.sleep(wait)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,7 +174,7 @@ class GovernmentInsightEngine:
             tlsAllowInvalidCertificates=False,
             retryWrites=True,
         )
-        self._mongo.admin.command("ping")
+        _ping_with_retry(self._mongo)
         print("  GovInsight: MongoDB connected.")
 
         self._source_db = self._mongo["test"]
@@ -166,7 +192,7 @@ class GovernmentInsightEngine:
             temperature=0.3,
             repeat_penalty=1.1,
             num_ctx=4096,
-            timeout=90,
+            client_kwargs={"timeout": 240},  # A8: insight generate menjalankan banyak invoke — 90s terlalu ketat saat Ollama sedang sibuk
         )
         print(f"  GovInsight: LLM ready ({MODEL_NAME}).")
 
@@ -285,20 +311,30 @@ class GovernmentInsightEngine:
         print(f"  Government Insight Engine — {now_str} UTC")
         print(f"{'=' * 60}")
 
-        for col_name in SOURCE_COLLECTIONS:
+        for i, col_name in enumerate(SOURCE_COLLECTIONS):
             try:
                 if force_all:
                     self._process_collection(col_name)
                 else:
                     self._process_if_changed(col_name)
             except Exception as e:
-                print(f"  [ERROR] {col_name}: {e}")
+                # A1: sebut tipe exception + nama field agar diagnosable satu baris
+                print(f"  [ERROR] {col_name}: {type(e).__name__}: {e} (field: tahun)")
                 traceback.print_exc()
+            finally:
+                # M0b: jeda antar LLM call — jangan banjiri Ollama lokal saat
+                # full refresh (chatbot & embedding ikut pakai mesin yang sama).
+                if i < len(SOURCE_COLLECTIONS) - 1 and INSIGHT_LLM_DELAY > 0:
+                    time.sleep(INSIGHT_LLM_DELAY)
 
         self._check_monthly_refresh()
 
     def run_loop(self, interval: int = POLL_INTERVAL):
         print(f"\n  [loop] Polling every {interval}s. Ctrl+C to stop.\n")
+        if STARTUP_GRACE_SECONDS > 0:
+            print(f"  ⏳  Startup grace {STARTUP_GRACE_SECONDS}s — biarkan chatbot "
+                  f"dan watchers warm-up dulu (hindari kontes Ollama)...")
+            time.sleep(STARTUP_GRACE_SECONDS)
         self.run_once(force_all=True)
         while True:
             try:
@@ -362,9 +398,17 @@ class GovernmentInsightEngine:
         parts = [f"Koleksi: {col_name}", f"Jumlah dokumen: {total}", f"Kolom: {', '.join(fields)}"]
 
         if "tahun" in fields:
-            years = sorted(col.distinct("tahun"))
-            if len(years) > 1:
-                parts.append(f"Periode data: {years[0]} - {years[-1]} ({len(years)} tahun)")
+            # A1: distinct("tahun") bisa berisi campuran None/str/int — sort
+            # dgn None diffilter + normalisasi str agar tidak TypeError '<'.
+            raw_years = col.distinct("tahun")
+            years = sorted(
+                (y for y in raw_years if y is not None),
+                key=lambda y: str(y),
+            )
+            if not years:
+                parts.append("Tahun: tidak ada data tahun tersedia")
+            elif len(years) > 1:
+                parts.append(f"Periode data: {str(years[0])} - {str(years[-1])} ({len(years)} tahun)")
             else:
                 parts.append(f"Tahun: {years[0]}")
 

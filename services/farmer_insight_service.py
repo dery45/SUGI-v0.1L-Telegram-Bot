@@ -45,7 +45,7 @@ if not MONGO_URI:
 
 import certifi
 from pymongo import MongoClient, ReplaceOne
-from pymongo.errors import PyMongoError
+from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
@@ -66,6 +66,14 @@ POLICY_MAX_CHARS = 500
 
 DAILY_INTERVAL = 86400
 CHANGE_CHECK_INTERVAL = 3600
+
+# M0: jeda antar LLM call + startup grace — jangan banjiri Ollama lokal saat
+# full refresh (chatbot & embedding ikut pakai mesin yang sama).
+INSIGHT_LLM_DELAY = float(os.getenv("INSIGHT_LLM_DELAY", "1"))
+STARTUP_GRACE_SECONDS = int(os.getenv(
+    "FARMER_INSIGHT_GRACE_SECONDS",
+    os.getenv("STARTUP_GRACE_SECONDS", "300"),
+))
 
 # ─── Farmer Insight Definitions ───────────────────────────────────────────
 
@@ -233,6 +241,27 @@ TULIS SATU PARAGRAF REKOMENDASI ({min_chars}-{max_chars} karakter — tanpa list
 # ENGINE
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
+    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
+
+    Atlas kadang transient "No primary found" saat pemilihan topologi baru
+    (ServerSelectionTimeoutError). Dulu __init__ ping sekali tanpa retry dan
+    hanya mengandalkan restart proses luar di start_all.py — tambahkan retry
+    di dalam service sendiri (sama seperti government_insight_service).
+    """
+    for attempt in range(attempts):
+        try:
+            mongo.admin.command("ping")
+            return
+        except ServerSelectionTimeoutError as e:
+            if attempt == attempts - 1:
+                raise
+            wait = base_wait * (attempt + 1)
+            print(f"  FarmerInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
+                  f"retrying in {wait}s: {e}")
+            time.sleep(wait)
+
+
 class FarmerInsightEngine:
 
     def __init__(self):
@@ -249,7 +278,7 @@ class FarmerInsightEngine:
             tlsAllowInvalidCertificates=False,
             retryWrites=True,
         )
-        self._mongo.admin.command("ping")
+        _ping_with_retry(self._mongo)
         self._source_db = self._mongo["test"]
         self._target_sugi = self._mongo["sugi_insights"]
         self._target_test = self._mongo["test"]
@@ -267,7 +296,7 @@ class FarmerInsightEngine:
             temperature=0.3,
             repeat_penalty=1.1,
             num_ctx=4096,
-            timeout=90,
+            client_kwargs={"timeout": 240},  # A8: insight generate menjalankan banyak invoke — 90s terlalu ketat saat Ollama sedang sibuk
         )
         print(f"  FarmerInsight: LLM ready ({MODEL_NAME}).")
 
@@ -815,21 +844,6 @@ class FarmerInsightEngine:
             t = re.sub(pat, '', t, flags=re.IGNORECASE)
         t = t.strip()
         return t
-        """Remove any stray labels, brackets, or prefixes from generated text."""
-        t = text.strip()
-        # Remove [anything] at start
-        t = re.sub(r'^\s*\[.*?\]\s*', '', t)
-        # Remove common English label prefixes
-        for pat in [
-            r'^(Best Commodity|Food Surplus|Regional Food Reserve|Best Province|'
-            r'Planting Recommendation|Selling Recommendation|Monthly Opportunity|'
-            r'Margin Status|PPH Score|Commodity Surplus|Market Opportunity|'
-            r'National PPH Score|Producer.Consumer Margin|'
-            r'Info|Positive|Warning|Danger)\s*[:.>-]?\s*',
-        ]:
-            t = re.sub(pat, '', t, flags=re.IGNORECASE)
-        t = t.strip()
-        return t
 
     def _generate_farmer_insight(self, defn: dict) -> Optional[dict]:
         key = defn["key"]
@@ -1148,7 +1162,7 @@ class FarmerInsightEngine:
 
     def run_all(self):
         print("\n  ── Generating all farmer insights (10) ──")
-        for defn in FARMER_INSIGHT_DEFS:
+        for i, defn in enumerate(FARMER_INSIGHT_DEFS):
             try:
                 result = self._generate_farmer_insight(defn)
                 if result:
@@ -1156,6 +1170,10 @@ class FarmerInsightEngine:
             except Exception as e:
                 print(f"  [ERROR] {defn['key']}: {e}")
                 traceback.print_exc()
+            finally:
+                # M0b: jeda antar LLM call agar tidak membanjiri Ollama lokal.
+                if i < len(FARMER_INSIGHT_DEFS) - 1 and INSIGHT_LLM_DELAY > 0:
+                    time.sleep(INSIGHT_LLM_DELAY)
 
         print("\n  ── Generating Government Policy Recommendation ──")
         try:
@@ -1204,6 +1222,11 @@ class FarmerInsightEngine:
     def run_loop(self):
         print(f"\n  [loop] Polling every {CHANGE_CHECK_INTERVAL}s, "
               f"full refresh every {DAILY_INTERVAL}s. Ctrl+C to stop.\n")
+
+        if STARTUP_GRACE_SECONDS > 0:
+            print(f"  ⏳  Startup grace {STARTUP_GRACE_SECONDS}s — biarkan chatbot "
+                  f"dan watchers warm-up dulu (hindari kontes Ollama)...")
+            time.sleep(STARTUP_GRACE_SECONDS)
 
         self.run_all()  # full generation on startup
 

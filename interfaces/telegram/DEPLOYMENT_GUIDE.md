@@ -71,6 +71,12 @@ SUGI uses a `.env` file in `config/` for all configurations. Use `config/.env.ex
 | `SCOPE_CONFIG_PATH` | Allowed agricultural topics config | `config/settings/scope_config.ini` |
 | `REWRITER_CONFIG_PATH` | Query rewriting rules config | `config/settings/rewriter_config.ini` |
 | `PLANT_CONFIG_PATH` | Plant detection & mapping config | `config/settings/plant_keywords.ini` |
+| `DAILY_INSIGHT_GRACE_SECONDS` | Daily insight startup grace (A8) | `180` |
+| `GOVERNMENT_INSIGHT_GRACE_SECONDS` | Government insight startup grace (A8) | `240` |
+| `FARMER_INSIGHT_GRACE_SECONDS` | Farmer insight startup grace (A8) | `300` |
+| `STARTUP_GRACE_SECONDS` | Fallback startup grace (all services) | `180` |
+| `INSIGHT_LLM_DELAY` | Seconds between insight LLM calls (A8/A12); `0` = off | `1` |
+| `DAILY_INSIGHT_MAX_WORKERS` | Daily insight LLM workers (A12): `1` = sequential + pacing; `>1` = bounded pool | `1` |
 
 ---
 

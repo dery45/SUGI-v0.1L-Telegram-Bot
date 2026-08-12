@@ -25,6 +25,8 @@ load_dotenv(_ROOT / "config" / ".env")
 DATASET_DIR     = str(_ROOT / "data" / "raw_dataset")
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "mxbai-embed-large")
 BM25_CACHE_PATH = os.getenv("BM25_CACHE_PATH", str(_ROOT / "data" / "db" / "bm25_cache.pkl"))
+# M0: tunda initial scan agar chatbot (yang juga pakai Ollama) warm-up dulu.
+STARTUP_GRACE_SECONDS = int(os.getenv("STARTUP_GRACE_SECONDS", "180"))
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────
 # Ganti host/port sesuai setup kamu.
@@ -275,6 +277,11 @@ if __name__ == "__main__":
     os.makedirs(DATASET_DIR, exist_ok=True)
     print(f"🚀 CSV/XLSX Vector Server started. Watching '{DATASET_DIR}/'...")
     print(f"📐 Chunk strategies active: {list(CHUNK_STRATEGIES.keys())}")
+
+    if STARTUP_GRACE_SECONDS > 0:
+        print(f"⏳  Startup grace {STARTUP_GRACE_SECONDS}s sebelum initial scan "
+              f"(hindari kontes embedding dengan chatbot)...")
+        time.sleep(STARTUP_GRACE_SECONDS)
 
     index_all_existing()
 

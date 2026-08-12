@@ -19,6 +19,7 @@ import time
 import random
 import threading
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 from dotenv import load_dotenv
@@ -62,6 +63,42 @@ plant_store = Chroma(
     embedding_function=_embeddings,
 )
 
+# ─── Session-level rate limit flag ──────────────────────────────────────────
+# Di-set ke waktu +1 jam saat _get() menyerah karena 429 pada panggilan sekuensial.
+# Fungsi API akan skip request jika waktu sekarang < flag ini.
+# A5: semua akses baca/tulis dibungkus threading.Lock — fetch detail sekarang
+# berjalan paralel (max_workers=3), tanpa lock beberapa worker bisa balapan
+# men-set flag global dan mematikan API untuk semua user selama 1 jam hanya
+# karena satu 429 dari satu worker.
+# A11: block ini sengaja ditaruh SEBELUM startup API-key validation — blok
+# validasi memanggil _trip_rate_limit() di cabang 429; di modul top-level yang
+# dieksekusi sekuensial saat import, pemanggilan sebelum definisi akan memicu
+# NameError yang TIDAK tertangkap oleh `except ImportError` di sugi_core.
+_api_rate_limit_until = 0.0
+_rate_limit_lock = threading.Lock()
+
+
+def _is_rate_limited() -> bool:
+    """True jika Perenual sedang dalam cooldown 1 jam (429 sebelumnya)."""
+    with _rate_limit_lock:
+        return time.time() < _api_rate_limit_until
+
+
+def _trip_rate_limit() -> bool:
+    """Aktifkan cooldown 1 jam. Thread-safe (A5: tidak ada race read-modify-write).
+
+    Return True hanya jika flag BARU di-set (dari non-cooldown); False jika
+    sudah dalam cooldown — pemanggil memakai ini untuk mencegah log "dimatikan"
+    berulang saat beberapa thread kena 429 bersamaan.
+    """
+    global _api_rate_limit_until
+    with _rate_limit_lock:
+        if time.time() < _api_rate_limit_until:
+            return False
+        _api_rate_limit_until = time.time() + 3600
+        return True
+
+
 # ─── API Key Validation on Startup ────────────────────────────────────────────
 if PERENUAL_KEY and PERENUAL_KEY != "sk-your-api-key-here":
     try:
@@ -76,7 +113,7 @@ if PERENUAL_KEY and PERENUAL_KEY != "sk-your-api-key-here":
             PERENUAL_KEY = ""
         elif _test_resp.status_code == 429:
             print("   ⚠️  Perenual API 429 Rate Limit hit on startup — pausing 1 hour.")
-            _api_rate_limit_until = time.time() + 3600
+            _trip_rate_limit()
         else:
             print("   ✅ Perenual API key valid.")
     except Exception as _e:
@@ -108,11 +145,6 @@ class _ApiQueue:
 
 _queue = _ApiQueue(min_interval=1.1)
 
-# ─── Session-level rate limit flag ──────────────────────────────────────────
-# Di-set ke waktu +1 jam saat _get() menyerah setelah semua retry habis karena 429.
-# Fungsi API akan skip request jika waktu sekarang < flag ini.
-_api_rate_limit_until = 0.0
-
 
 # ─── HTTP helper dengan flat retry ───────────────────────────────────────────
 _MAX_RETRIES  = 0      # max 0 retry (1 attempt total) — gagal cepat
@@ -120,9 +152,17 @@ _BACKOFF_FLAT = 1.5    # detik flat per retry — tidak eksponensial
 _JITTER_MAX   = 0.3    # jitter kecil untuk menghindari thundering herd
 
 
-def _get(url: str, params: dict) -> Optional[dict]:
-    global _api_rate_limit_until
-    if time.time() < _api_rate_limit_until:
+def _get(url: str, params: dict, trip_on_429: bool = True) -> Optional[dict]:
+    """GET helper dengan rate limiting + flat retry.
+
+    trip_on_429:
+      True  → 429 menonaktifkan API selama 1 jam (panggilan sekuensial,
+              mis. _fetch_species_list / pest-disease / care-guide).
+      False → 429 hanya membuat panggilan itu gagal, TIDAK menonaktifkan API
+              (panggilan paralel detail species — satu worker ke-429 bukan
+              bukti kuota habis, hanya burst throttling; lihat A5).
+    """
+    if _is_rate_limited():
         return None
     attempt = 0
 
@@ -136,9 +176,12 @@ def _get(url: str, params: dict) -> Optional[dict]:
             if resp.status_code == 429:
                 attempt += 1
                 if attempt > _MAX_RETRIES:
-                    _api_rate_limit_until = time.time() + 3600
-                    print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan selama 1 jam.")
-                    print(f"   ℹ️  Jawaban akan sementara menggunakan data RAG lokal.")
+                    if trip_on_429:
+                        if _trip_rate_limit():
+                            print(f"   ❌ 429 after {_MAX_RETRIES} retries — Perenual API dimatikan selama 1 jam.")
+                            print(f"   ℹ️  Jawaban akan sementara menggunakan data RAG lokal.")
+                    else:
+                        print(f"   ⚠️  429 rate limit pada panggilan paralel — dilewati tanpa menonaktifkan API.")
                     return None
 
                 # Cek header Retry-After dari server, tapi cap di 3 detik
@@ -237,7 +280,9 @@ def _fetch_species_list(plant_name: str, page: int = 1) -> list[dict]:
 
 
 def _fetch_species_detail(plant_id: int) -> Optional[dict]:
-    return _get(f"{PERENUAL_BASE}/species/details/{plant_id}", {"key": PERENUAL_KEY})
+    # trip_on_429=False (A5): panggilan ini berjalan PARALEL (max_workers=3);
+    # 429 pada satu worker = normal burst throttling, jangan matikan API 1 jam.
+    return _get(f"{PERENUAL_BASE}/species/details/{plant_id}", {"key": PERENUAL_KEY}, trip_on_429=False)
 
 
 def _species_to_text(detail: dict) -> str:
@@ -286,30 +331,43 @@ def fetch_plant_species(plant_name: str) -> list[Document]:
         print(f"   ℹ️  No species results found for '{plant_name}'.")
         return []
 
-    documents = []
-    for item in species_list[:5]:
-        plant_id = item.get("id")
-        if not plant_id:
-            continue
-        detail = _fetch_species_detail(plant_id)
-        if not detail:
-            continue
-        text   = _species_to_text(detail)
-        doc_id = _doc_id(f"species:{plant_id}")
-        img_url = ""
-        if detail.get("default_image"):
-            img_url = detail["default_image"].get("regular_url", "")
-        documents.append(Document(
-            page_content=text,
-            metadata={
-                "source":      "perenual_species",
-                "cache_key":   cache_key,
-                "plant_id":    str(plant_id),
-                "common_name": detail.get("common_name", ""),
-                "image_url":   img_url,
-            },
-            id=doc_id,
-        ))
+    candidate_ids = [item.get("id") for item in species_list[:5] if item.get("id")]
+    documents     = []
+
+    # Fetch detail species secara paralel (bounded pool, max_workers=3).
+    # _ApiQueue.wait() di dalam _get() tetap menjamin rate ke Perenual
+    # (spacing global 1.1s); konkuensi hanya menghilangkan penjumlahan
+    # wall-clock RTT antar request — bukan mencoba melampaui rate limit.
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        future_to_id = {
+            pool.submit(_fetch_species_detail, pid): pid
+            for pid in candidate_ids
+        }
+        for future in as_completed(future_to_id):
+            plant_id = future_to_id[future]
+            try:
+                detail = future.result()
+            except Exception as e:
+                print(f"   ⚠️  Detail fetch failed for species {plant_id}: {e}")
+                continue
+            if not detail:
+                continue
+            text   = _species_to_text(detail)
+            doc_id = _doc_id(f"species:{plant_id}")
+            img_url = ""
+            if detail.get("default_image"):
+                img_url = detail["default_image"].get("regular_url", "")
+            documents.append(Document(
+                page_content=text,
+                metadata={
+                    "source":      "perenual_species",
+                    "cache_key":   cache_key,
+                    "plant_id":    str(plant_id),
+                    "common_name": detail.get("common_name", ""),
+                    "image_url":   img_url,
+                },
+                id=doc_id,
+            ))
 
     _store_docs(documents)
     return documents
@@ -441,7 +499,7 @@ def get_cached_plant_docs(plant_name: str, k: int = 6) -> list[Document]:
 
 
 def search_plant_info(plant_name: str) -> list[Document]:
-    if time.time() < _api_rate_limit_until:
+    if _is_rate_limited():
         print("   ⏭️  Perenual API dinonaktifkan (429 sebelumnya) — pakai RAG lokal.")
         return []
     if not PERENUAL_KEY or PERENUAL_KEY == "sk-your-api-key-here":

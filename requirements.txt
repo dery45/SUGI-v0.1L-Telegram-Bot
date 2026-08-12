@@ -21,6 +21,8 @@ rank_bm25>=0.2
 
 # PDF loading
 pypdf>=4.0
+# AES-decrypted PDF (Buku POC.pdf dkk) — PyPDFLoader butuh ini untuk AES
+cryptography>=3.1
 
 # Data processing
 pandas>=2.0

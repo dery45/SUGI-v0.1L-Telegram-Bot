@@ -53,8 +53,13 @@ MONGO_URI      = os.getenv("MONGO_URI", "").strip()
 CHROMA_HOST    = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT    = int(os.getenv("CHROMA_PORT", "8000"))
 INTERVAL_HOURS = float(os.getenv("INSIGHT_INTERVAL_HOURS", "12"))
-BATCH_SIZE     = 500
-MAX_WORKERS    = 5
+STARTUP_GRACE_SECONDS = int(os.getenv(
+    "DAILY_INSIGHT_GRACE_SECONDS",
+    os.getenv("STARTUP_GRACE_SECONDS", "180"),
+))
+BATCH_SIZE            = 500
+INSIGHT_LLM_DELAY     = float(os.getenv("INSIGHT_LLM_DELAY", "1"))
+DAILY_INSIGHT_MAX_WORKERS = int(os.getenv("DAILY_INSIGHT_MAX_WORKERS", "1"))
 
 if not MONGO_URI:
     print("❌  MONGO_URI tidak di-set di .env atau environment variable.")
@@ -68,7 +73,7 @@ print(f"🔒  OpenSSL version: {ssl.OPENSSL_VERSION}")
 try:
     import certifi
     from pymongo import MongoClient, UpdateOne
-    from pymongo.errors import PyMongoError
+    from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
 except ImportError:
     print("❌  pymongo / certifi belum terinstall.")
     print("    Jalankan: pip install pymongo certifi")
@@ -97,10 +102,32 @@ def _build_mongo_client() -> MongoClient:
     )
 
 
+def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
+    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
+
+    Atlas kadang transient "No primary found" saat pemilihan topologi baru
+    selesai (ServerSelectionTimeoutError). Dulu startup ping sekali tanpa
+    retry dan langsung sys.exit(1), hanya mengandalkan restart proses luar
+    di start_all.py — tambahkan retry di dalam service sendiri (sama seperti
+    farmer_insight_service dan government_insight_service).
+    """
+    for attempt in range(attempts):
+        try:
+            mongo.admin.command("ping")
+            return
+        except ServerSelectionTimeoutError as e:
+            if attempt == attempts - 1:
+                raise
+            wait = base_wait * (attempt + 1)
+            print(f"  DailyInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
+                  f"retrying in {wait}s: {e}")
+            time.sleep(wait)
+
+
 try:
     _mongo_client = _build_mongo_client()
     # Test koneksi saat startup
-    _mongo_client.admin.command("ping")
+    _ping_with_retry(_mongo_client)
     print("✅  MongoDB Atlas terhubung.")
 except Exception as e:
     print(f"❌  Gagal koneksi ke MongoDB Atlas: {e}")
@@ -142,7 +169,15 @@ except Exception as e:
 # ── Ollama LLM ────────────────────────────────────────────────────────────────
 try:
     from langchain_ollama.llms import OllamaLLM
-    _llm = OllamaLLM(model="qwen2.5:1.5b", temperature=0.4, repeat_penalty=1.1)
+    # A8: timeout 240s — insight generate memanggil LLM berkali-kali dengan
+    # model yang bisa bergantian dimuat di Ollama (bersaing dgn chatbot).
+    _llm = OllamaLLM(
+        model="qwen2.5:1.5b",
+        temperature=0.4,
+        repeat_penalty=1.1,
+        num_ctx=4096,
+        client_kwargs={"timeout": 240},
+    )
     print("✅  LLM (qwen2.5:1.5b) siap.")
 except Exception as e:
     _llm = None
@@ -199,6 +234,31 @@ def _ask_llm(prompt: str, fallback: str = "") -> str:
     except Exception as e:
         print(f"   ⚠️  LLM error: {e}")
         return fallback
+
+
+def _run_paced(items: list, worker_fn) -> list:
+    """
+    A8-fix: jalankan worker_fn untuk setiap item dengan pacing — TIDAK meledakkan
+    banyak request LLM konkuren ke Ollama sekaligus (Ollama meng-antre, bukan
+    benar-benar memparalelkan; burst konkuren memicu timeout seperti A8 dulu).
+
+    Default DAILY_INSIGHT_MAX_WORKERS=1 → berurutan dengan jeda INSIGHT_LLM_DELAY
+    antar panggilan (pola sama seperti farmer/gov insight service).
+    Jika di-set >1 via env → baru pakai thread pool (keputusan deliberate via env,
+    bukan leftover default).
+    """
+    max_workers = DAILY_INSIGHT_MAX_WORKERS
+    if max_workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+            return list(ex.map(worker_fn, items))
+
+    results = []
+    total = len(items)
+    for i, item in enumerate(items):
+        results.append(worker_fn(item))
+        if i < total - 1 and INSIGHT_LLM_DELAY > 0:
+            time.sleep(INSIGHT_LLM_DELAY)
+    return results
 
 
 def _doc_hash(text: str, category: str, scope: str) -> str:
@@ -325,8 +385,7 @@ def generate_price_insights(date_str: str) -> list[dict]:
             doc_count = len(texts),
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(lambda kv: _process(*kv), groups.items()))
+    results = _run_paced(list(groups.items()), lambda kv: _process(*kv))
 
     print(f"   📊  {len(results)} price insights dari {len(price_docs)} dokumen.")
     return results
@@ -374,8 +433,7 @@ def generate_weather_insights(date_str: str) -> list[dict]:
             doc_count = len(texts),
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(lambda kv: _process(*kv), groups.items()))
+    results = _run_paced(list(groups.items()), lambda kv: _process(*kv))
 
     print(f"   🌦️   {len(results)} weather insights dari {len(docs)} dokumen.")
     return results
@@ -429,8 +487,7 @@ def generate_planting_suggestions(date_str: str) -> list[dict]:
             data_available = len(relevant) > 0,
         )
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        results = list(ex.map(_process, _KOMODITAS_UTAMA))
+    results = _run_paced(_KOMODITAS_UTAMA, _process)
 
     print(f"   🌾  {len(results)} planting suggestions ({musim}).")
     return results
@@ -569,6 +626,11 @@ def run_loop(interval_hours: float = INTERVAL_HOURS) -> None:
     interval_sec = interval_hours * 3600
     print(f"⏰  Loop aktif — interval setiap {interval_hours:.1f} jam. "
           f"Ctrl+C untuk berhenti.\n")
+
+    if STARTUP_GRACE_SECONDS > 0:
+        print(f"⏳  Startup grace {STARTUP_GRACE_SECONDS}s — hindari kontes "
+              f"Ollama dengan chatbot pada menit awal...")
+        time.sleep(STARTUP_GRACE_SECONDS)
 
     while True:
         run_once()

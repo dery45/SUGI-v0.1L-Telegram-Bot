@@ -106,6 +106,13 @@ poetry.lock
 temp/
 tmp/
 
+# Documentation — internal only, EXCEPT doc/CHANGELOG.md (tracked)
+docs/*
+!docs/CHANGELOG.md
+
+# Tests — internal verification scripts, not tracked
+tests/
+
 # User data & platform-specific databases
 data/users.json
 data/cli_user.txt

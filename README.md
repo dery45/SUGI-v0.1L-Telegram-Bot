@@ -42,8 +42,16 @@ Here is SUGI AI in action on Telegram:
   - Daily weather + agronomic alerts (drought, flood, heat stress, disease) from Open-Meteo  
   - Complete plant information (species, pests, diseases, care guides) via Perenual API  
   - **Fast Failure API** → Fails in <1s if rate limited (429), immediately falling back to local RAG data.
+  - **Crash-Safe Startup (A11)** → rate-limit flag helpers now defined before the startup API-key validation that calls them, so a 429 during boot trips the 1-hour cooldown cleanly instead of raising `NameError` (which an `except ImportError` guard can't catch) and killing the whole bot.
   - Automatic indexing for CSV/XLSX/PDF (commodity prices, cultivation guides, etc.)  
 - **Stability Guard** → 8,000 character truncation & 4,096 context window to prevent overflow errors.
+- **Resource Contention Hardening (M0/A8)** → `STARTUP_GRACE_SECONDS` staggers the first full run of background services (farmer/gov insight, daily insight, vector watchers) so the chatbot wins the Ollama warm-up race; `INSIGHT_LLM_DELAY` paces the LLM calls inside insight loops. A8 refines this per service: staggered grace (`DAILY_INSIGHT_GRACE_SECONDS=180`, `GOVERNMENT_INSIGHT_GRACE_SECONDS=240`, `FARMER_INSIGHT_GRACE_SECONDS=300`) and a 240s insight-only LLM timeout so engines never wake simultaneously or block on a busy Ollama.
+- **Daily Insight Concurrency Backfill (A12)** → `daily_insight.py` no longer fires 5 simultaneous LLM calls via a hardcoded `ThreadPoolExecutor(max_workers=5)`; its price/weather/planting generators now run through `_run_paced()` — sequential by default with `INSIGHT_LLM_DELAY` pacing (`DAILY_INSIGHT_MAX_WORKERS=1`), so a single `run_once()` can't push Ollama calls toward timeout. Setting `DAILY_INSIGHT_MAX_WORKERS>1` explicitly restores a bounded thread pool.
+- **Transient Mongo Retry (A7 backfill)** → `daily_insight.py` startup ping now wraps Atlas "No primary" errors in `_ping_with_retry` (3 attempts, 5s/10s linear backoff) instead of exiting on the first hiccup — matching the farmer/gov insight services.
+- **Multi-turn History Gating (A9)** → `{history}` is injected into the prompt only when the rewriter detects a referential/follow-up signal; self-contained questions get an empty history, so prior answers (e.g. apple) can't poison a new topic (e.g. December planting).
+- **Retrieval-Level Memory Gating (A10 + A4)** → the same `needs_ref_context` signal now also gates the *retrieval* path: memory-store similarity search and its merge into the context run only for genuinely referential follow-ups, closing the second leak pipe A9 couldn't reach (old-topic chunks like labu siam arriving via memory). A4 closed in the same pass: the shared unfiltered `memory_retriever` (no `user_id` filter, cross-user privacy risk) is removed — only the correctly user-scoped memory path remains.
+- **Unified Single-Pass Reranking (M1 + A11)** → Weather docs are merged into the RAG pool and ALL candidates pass through the CrossEncoderReranker exactly once — no irrelevant weather chunks winning prompt slots by sheer count, and no double-scoring of the RAG portion (the ensemble retriever is no longer wrapped in a compression retriever that pre-reranked it).
+- **Context Cap & Prompt Trim (M2)** → Final context capped at 8 chunks to fit `num_ctx=4096`; persona moved to the Modelfile SYSTEM prompt, session date/time info pinned to the bottom of the answer prompt, bullet depth limited to 1 level.
 - **Embedding Safety** → Automatically truncates long documents (>2,000 chars) before storage to fit embedding model limits. Failed embeddings are caught gracefully without crashing.
 - **Long-term Memory** → Session summaries stored in ChromaDB for multi-turn context  
 - **Daily Insight Engine** → Sends daily insights to MongoDB every 12 hours (regional prices, weather, planting tips, policies).
@@ -60,8 +68,8 @@ Here is SUGI AI in action on Telegram:
 | **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama) |
 | **Utility Model** | `qwen2.5:1.5b` — query rewriting fallback, plant extraction, eval loop, insights |
 | **Embedding** | `mxbai-embed-large` (Ollama) |
-| **Vector Store** | ChromaDB Server mode — 4 collections |
-| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=5, k=2-8) |
+| **Vector Store** | ChromaDB Server mode — 6 collections |
+| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=8) — **single pass over RAG ± weather (M1 + A11)**; memory retrieved separately & user-scoped, gated by `needs_ref_context` (A10/A4) |
 | **Insight DB** | MongoDB Atlas — 7 collections across `sugi_insights` + `test` databases (write-only) |
 | **External APIs** | Open-Meteo (Free weather), Perenual (Plants & Pests) |
 | **Framework** | LangChain, LangChain-Classic |
@@ -70,7 +78,7 @@ Here is SUGI AI in action on Telegram:
 
 ## 🗄️ Database Schema
 
-### ChromaDB (4 collections — READ/WRITE)
+### ChromaDB (6 collections — READ/WRITE)
 
 | Collection | Size | Source | Write Trigger | Read Trigger | Schema |
 |-----------|------|--------|---------------|--------------|--------|
@@ -78,12 +86,14 @@ Here is SUGI AI in action on Telegram:
 | `weather_data` | ~109 daily summaries | `vectorWeather.py` | Every day change detected (loop every 300s) | Weather query detected → `similarity_search(k=8)` | `{source, location, date, fetch_date, page_content}` |
 | `plant_data` | Per-plant cache | `plant_api.py` | Plant query → Perenual API fetch | Plant query detected → `similarity_search(k=3)` | `{source, cache_key, plant_id?, common_name?, image_url?, cached_at, page_content}` |
 | `conversation_memory` | Per-user session summaries | `sugi_core.py` | Every 5 user questions → LLM-summarized | Every query (filter by user_id, k=2) + memory recall | `{source, user_id, session_id, timestamp, page_content}` |
+| `government_memory` | ~15 docs | `government_insight_service.py` | Per-collection insight generation | Cross-collection learning loop in next generation | `{source, sourceCollection, theme, insightVersion, totalDocuments, generatedAt, page_content}` |
+| `insights_memory` | ~11 docs | `farmer_insight_service.py` | Farmer insight + policy generation | Historical memory for future generations | `{source, insightKey, version, type, title, generatedAt, page_content}` |
 
-### MongoDB (2 databases, 7 collections — WRITE only)
+### MongoDB (2 databases, 7 collections)
 
-`sugi_insights` database written every 12 hours by `daily_insight.py`.  
-`test.governmentinsights` + `test.farmerinsights` written by `government_insight_service.py` and `farmer_insight_service.py`.  
-**Zero reads** from the application — data is consumed by external dashboards.
+`test` database: source data (read) + insight output (write).  
+`sugi_insights` database: analytics output only (write).  
+Data consumed by external dashboards — zero reads from chatbot application.
 
 | Database | Collection | Doc Count | Service | Content |
 |----------|-----------|-----------|---------|---------|
@@ -129,6 +139,12 @@ Here is SUGI AI in action on Telegram:
 | `LATITUDE` | No | `-6.1818` | Weather data latitude (Jakarta) |
 | `LONGITUDE` | No | `106.8223` | Weather data longitude (Jakarta) |
 | `LOCATION_NAME` | No | `Jakarta` | Display name for weather location |
+| `DAILY_INSIGHT_GRACE_SECONDS` | No | `180` | Daily insight startup grace before first run (A8) |
+| `GOVERNMENT_INSIGHT_GRACE_SECONDS` | No | `240` | Government insight startup grace (A8) |
+| `FARMER_INSIGHT_GRACE_SECONDS` | No | `300` | Farmer insight startup grace (A8) |
+| `STARTUP_GRACE_SECONDS` | No | `180` | Fallback grace for all services (A8) |
+| `INSIGHT_LLM_DELAY` | No | `1` | Seconds between insight LLM calls (A8/A12); `0` = off |
+| `DAILY_INSIGHT_MAX_WORKERS` | No | `1` | Daily insight LLM workers (A12): `1` = sequential + pacing; `>1` = bounded thread pool |
 
 ### `config/settings/scope_config.ini` — Domain Guard
 
@@ -195,17 +211,18 @@ User Question
 │ [4] HYBRID RETRIEVAL                         │
 │   ├── BM25 Retriever (k=4)                   │
 │   ├── Vector Retriever (k=4)                 │
-│   ├── Memory Retriever (k=2, if history)     │
 │   ├── Plant Retriever (k=3, if plant query)  │
-│   └── Weather Retriever (k=8, if weather)    │
+│   └── Memory Search (k=2, if referential)    │
 │                                              │
-│   Ensemble weights: base 0.60, mem 0.10,     │
-│   plant 0.15, weather 0.15                   │
+│   Ensemble weights: base 0.60, plant 0.15    │
+│   (memory is searched separately & gated by  │
+│    needs_ref_context — A10/A4)               │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
 │ [5] CROSS-ENCODER RERANKER                   │
-│   └── ms-marco-MiniLM-L-6-v2, top_n=5       │
+│   └── ms-marco-MiniLM-L-6-v2, top_n=8       │
+│   └── single pass over RAG ± weather (A11)  │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
@@ -387,9 +404,7 @@ SUGI-v0.1L/
 │       │   └── Typing indicator
 │       ├── requirements_telegram.txt
 │       └── DEPLOYMENT_GUIDE.md
-├── tests/
-│   ├── test_scope_leak.py           # Scope guard regression tests
-│   └── verify_fix.py                # Referential query fix verification
+├── tests/                           # Internal verification scripts (git-ignored)
 ├── data/                            # Runtime Data (all git-ignored)
 │   ├── db/                          # ChromaDB persistent storage
 │   │   ├── bm25_cache.pkl           # Serialized BM25 retriever
@@ -407,6 +422,9 @@ SUGI-v0.1L/
 ├── migrate_to_server.py             # ChromaDB embedded → server migration tool
 ├── generate_questions.py            # Seed question generator
 ├── test_mongo.py                    # MongoDB connection test
+├── docs/                            # Internal docs — only CHANGELOG.md tracked
+│   ├── CHANGELOG.md                 # Versioned changelog (tracked, committed)
+│   └── VERSIONS.md                  # Concise version overview (git-ignored)
 ├── requirements.txt                 # Python dependencies
 └── README.md
 ```
@@ -472,7 +490,31 @@ Evaluated on:
 
 ---
 
+## 📋 Changelog & Version History
+
+> Full details live in: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (detailed chronological changelog — the **only** tracked file in `docs/`; the rest is internal-only) and [`docs/VERSIONS.md`](docs/VERSIONS.md) (concise overview, git-ignored).
+
+**Current status:** v0.2.0 (work in progress — working tree @ Aug 2026) · committed HEAD `cd6f42b`
+
+| Version | Date | Status | Summary |
+|---|---|---|---|
+| **v0.2.0** | 2026-08 | ⏳ Working tree | Background eval (daemon thread), model residency `keep_alive=600`, eval stability (`num_ctx`/`num_predict`/timeout), parallel plant-detail fetch, scope-guard fix for `penanaman`, README DB schema (6 ChromaDB collections), `docs/CHANGELOG.md` changelog added & tracked, `tests/` git-ignored, A9 multi-turn history-poisoning fix, A8 insight-engine startup stagger (180/240/300s) + 240s LLM timeout, A10 retrieval-level memory gating + A4 closure (unfiltered `memory_retriever` removed), A11 startup-429 NameError fix + single-pass rerank + dead `include_weather`/`weather_retriever` removal + eval `num_predict=10`, A12 daily_insight concurrency backfill (pools → sequential `_run_paced` + `INSIGHT_LLM_DELAY`, `DAILY_INSIGHT_MAX_WORKERS` env) + A7 ping-retry (`_ping_with_retry` 5s/10s) |
+| **v0.1.9** | 2026-07-13 | ✔ Committed | Government & Farmer Insight Engines (+ChromaDB `government_memory`/`insights_memory`, MongoDB output) |
+| **v0.1.8** | 2026-06-03 | ✔ Committed | README/docs refresh + demo screenshots |
+| **v0.1.7** | 2026-04-13 | ✔ Committed | Telegram offline message catch-up, crash-safe offset persistence |
+| **v0.1.6** | 2026-03-27 | ✔ Committed | Insight pipeline API fixes, health-check wiring |
+| **v0.1.5** | 2026-03-26 | ✔ Committed | Thread safety (Telegram), streaming, Perenual API validation |
+| **v0.1.4** | 2026-03-25 | ✔ Committed | Chains Q&A + context-leak fix, scope gating, memory bug fix, startup health checks |
+| **v0.1.3** | 2026-03-24/25 | ✔ Committed | Repo hygiene + modular restructure (`core/ services/ interfaces/`, `start_all.py`) |
+| **v0.1.2** | 2026-03-15 | ✔ Committed | ChromaDB migration, `qwen2.5:1.5b` utility model, daily insight + bulk BM25, word config |
+| **v0.1.1** | 2026-03-15 | ✔ Committed | Rule-based rewriter + date logic, eval loop (faith/relevance/flag), query logging |
+| **v0.1.0** | 2026-03-15 | ✔ Committed | Initial release scaffolding (RAG chatbot, Modelfile, ingestion, question gen) |
+
+> Versioning note: the repository has no Git tags. Milestones above are reconstructed from `git log` by the changelog; product branding remains **v0.1L**.
+
+---
+
 ## License
 MIT License.
 
-Last updated: July 2026 · v0.1L (Scope-Hardened) · RAG Score 94/100
+Last updated: August 2026 · v0.1L (Scope-Hardened) · Changelog v0.2.0 · RAG Score 94/100

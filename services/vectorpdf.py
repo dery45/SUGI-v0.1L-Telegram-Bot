@@ -18,6 +18,8 @@ load_dotenv(_ROOT / "config" / ".env")
 
 DATASET_DIR = str(_ROOT / "data" / "raw_pdfs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
+# M0: tunda initial scan agar chatbot (yang juga pakai Ollama) warm-up dulu.
+STARTUP_GRACE_SECONDS = int(os.getenv("STARTUP_GRACE_SECONDS", "180"))
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────
 import chromadb as _chromadb
@@ -134,7 +136,13 @@ def index_file(file_path: str):
             print(f"✅ Indexed: {file_name}")
 
     except Exception as e:
-        print(f"❌ Error processing {file_name}: {e}")
+        err_str = str(e).lower()
+        # A2: PDF terenkripsi (AES / butuh password) bukan error generik —
+        # log khusus supaya tidak terbaca sebagai kegagalan sistem.
+        if "aes" in err_str or "encrypted" in err_str or "cryptography" in err_str:
+            print(f"🔒 Skipped (encrypted, needs password): {file_name}")
+        else:
+            print(f"❌ Error processing {file_name}: {e}")
 
 def index_all_existing():
     """Index any PDFs already present in the directory at startup."""
@@ -174,6 +182,11 @@ if __name__ == "__main__":
     os.makedirs(DATASET_DIR, exist_ok=True)
     print(f"🚀 PDF Vector Server started. Watching '{DATASET_DIR}/'...")
     print(f"   ChromaDB: {CHROMA_HOST}:{CHROMA_PORT}")
+
+    if STARTUP_GRACE_SECONDS > 0:
+        print(f"⏳  Startup grace {STARTUP_GRACE_SECONDS}s sebelum initial scan "
+              f"(hindari kontes embedding dengan chatbot)...")
+        time.sleep(STARTUP_GRACE_SECONDS)
 
     index_all_existing()
 
