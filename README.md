@@ -48,6 +48,10 @@ Here is SUGI AI in action on Telegram:
 - **Resource Contention Hardening (M0/A8)** → `STARTUP_GRACE_SECONDS` staggers the first full run of background services (farmer/gov insight, daily insight, vector watchers) so the chatbot wins the Ollama warm-up race; `INSIGHT_LLM_DELAY` paces the LLM calls inside insight loops. A8 refines this per service: staggered grace (`DAILY_INSIGHT_GRACE_SECONDS=180`, `GOVERNMENT_INSIGHT_GRACE_SECONDS=240`, `FARMER_INSIGHT_GRACE_SECONDS=300`) and a 240s insight-only LLM timeout so engines never wake simultaneously or block on a busy Ollama.
 - **Daily Insight Concurrency Backfill (A12)** → `daily_insight.py` no longer fires 5 simultaneous LLM calls via a hardcoded `ThreadPoolExecutor(max_workers=5)`; its price/weather/planting generators now run through `_run_paced()` — sequential by default with `INSIGHT_LLM_DELAY` pacing (`DAILY_INSIGHT_MAX_WORKERS=1`), so a single `run_once()` can't push Ollama calls toward timeout. Setting `DAILY_INSIGHT_MAX_WORKERS>1` explicitly restores a bounded thread pool.
 - **Transient Mongo Retry (A7 backfill)** → `daily_insight.py` startup ping now wraps Atlas "No primary" errors in `_ping_with_retry` (3 attempts, 5s/10s linear backoff) instead of exiting on the first hiccup — matching the farmer/gov insight services.
+- **Fail-Closed Debug Access (R1)** → `DEBUG_ALLOWED_USERS` is now **deny-by-default**: if unset (empty), `/debug` and all `!`-commands are blocked for everyone with a one-time startup warning. Previously an empty variable accidentally opened debug access to all users (both gate sites in `telegram_bot.py`).
+- **Blocked-Topics Enforced (R2)** → the 43-keyword `[blocked_topics]` list in `scope_config.ini` is now actually enforced by the scope guard — checked **before** allowed keywords, so blocked overrides allowed (e.g. "apakah padi bisa mengobati diabetes?" refuses despite "padi" being in-scope). The list was reviewed for agriculture false-positives before enabling.
+- **Global Telegram Error Handler (R3)** → any exception thrown outside `SugiCore.ask()`'s internal try/except (e.g. a failure while sending the reply) is caught by a registered PTB error handler that logs the traceback and replies "⚠️ Maaf, terjadi kesalahan tak terduga…" — the user never gets silence. Runtime-verified end-to-end.
+- **Content-Hash Re-indexing (R4)** → CSV/XLSX/PDF dedup is now by **content hash** (`file_hash` chunk metadata, MD5 over 8KiB blocks), not just filename. Editing an already-indexed file deletes its old chunks and re-indexes them; unchanged files are skipped. PDF indexing also gained the BM25 cache invalidation the CSV service already had.
 - **Multi-turn History Gating (A9)** → `{history}` is injected into the prompt only when the rewriter detects a referential/follow-up signal; self-contained questions get an empty history, so prior answers (e.g. apple) can't poison a new topic (e.g. December planting).
 - **Retrieval-Level Memory Gating (A10 + A4)** → the same `needs_ref_context` signal now also gates the *retrieval* path: memory-store similarity search and its merge into the context run only for genuinely referential follow-ups, closing the second leak pipe A9 couldn't reach (old-topic chunks like labu siam arriving via memory). A4 closed in the same pass: the shared unfiltered `memory_retriever` (no `user_id` filter, cross-user privacy risk) is removed — only the correctly user-scoped memory path remains.
 - **Unified Single-Pass Reranking (M1 + A11)** → Weather docs are merged into the RAG pool and ALL candidates pass through the CrossEncoderReranker exactly once — no irrelevant weather chunks winning prompt slots by sheer count, and no double-scoring of the RAG portion (the ensemble retriever is no longer wrapped in a compression retriever that pre-reranked it).
@@ -82,7 +86,7 @@ Here is SUGI AI in action on Telegram:
 
 | Collection | Size | Source | Write Trigger | Read Trigger | Schema |
 |-----------|------|--------|---------------|--------------|--------|
-| `main_dataset` | Dynamic | `vectorCSV.py`, `vectorpdf.py` | New CSV/XLSX/PDF file detected in `data/raw_dataset/` or `data/raw_pdfs/` | Every user query via ensemble retriever (k=4) | `{source, sheet?, row_id?, data_type, chunk_index, page_content}` |
+| `main_dataset` | Dynamic | `vectorCSV.py`, `vectorpdf.py` | New/edited CSV/XLSX/PDF in `data/raw_dataset/` or `data/raw_pdfs/` (dedup by `file_hash` content hash, R4) | Every user query via ensemble retriever (k=4) | `{source, sheet?, row_id?, data_type, file_hash?, chunk_index, page_content}` |
 | `weather_data` | ~109 daily summaries | `vectorWeather.py` | Every day change detected (loop every 300s) | Weather query detected → `similarity_search(k=8)` | `{source, location, date, fetch_date, page_content}` |
 | `plant_data` | Per-plant cache | `plant_api.py` | Plant query → Perenual API fetch | Plant query detected → `similarity_search(k=3)` | `{source, cache_key, plant_id?, common_name?, image_url?, cached_at, page_content}` |
 | `conversation_memory` | Per-user session summaries | `sugi_core.py` | Every 5 user questions → LLM-summarized | Every query (filter by user_id, k=2) + memory recall | `{source, user_id, session_id, timestamp, page_content}` |
@@ -135,7 +139,7 @@ Data consumed by external dashboards — zero reads from chatbot application.
 | `UTILITY_MODEL` | No | `qwen2.5:1.5b` | Ollama utility model (rewriting, eval) |
 | `MEMORY_TTL_DAYS` | No | `14` | Days to keep conversation memories |
 | `BM25_CACHE_PATH` | No | `bm25_cache.pkl` | Path to BM25 cache file |
-| `DEBUG_ALLOWED_USERS` | No | (all) | Comma-separated Telegram user IDs for debug |
+| `DEBUG_ALLOWED_USERS` | No | (empty — **all debug disabled**) | Comma-separated Telegram user IDs for `/debug` + `!`-commands (R1: fail-closed — empty denies everyone with a startup warning) |
 | `LATITUDE` | No | `-6.1818` | Weather data latitude (Jakarta) |
 | `LONGITUDE` | No | `106.8223` | Weather data longitude (Jakarta) |
 | `LOCATION_NAME` | No | `Jakarta` | Display name for weather location |
@@ -332,7 +336,7 @@ SUGI-v0.1L/
 │       ├── rewriter_config.ini      # Referential words, suffixes, followup regex, topic map
 │       └── plant_keywords.ini       # 60+ plant name mappings, strong/weak detection keywords
 ├── core/                            # Shared Engine Logic (platform-agnostic)
-│   ├── sugi_core.py                 # Main RAG pipeline (~1100 lines): SugiCore class
+│   ├── sugi_core.py                 # Main RAG pipeline (~1400 lines): SugiCore class
 │   │   ├── Query rewriting (3-layer)
 │   │   ├── Scope guard
 │   │   ├── Plant/weather detection
@@ -360,10 +364,11 @@ SUGI-v0.1L/
 │   │   ├── Multi-encoding CSV reader (utf-8, latin-1, cp1252)
 │   │   ├── XLSX multi-sheet reader
 │   │   ├── Auto-detect data type (price/policy/tabular) → adaptive chunk size
-│   │   └── BM25 cache invalidation on new data
+│   │   └── BM25 cache invalidation + content-hash re-index (R4)
 │   ├── vectorpdf.py                 # PDF watcher & indexer
 │   │   ├── Watchdog-based file monitoring
 │   │   ├── PyPDFLoader with adaptive chunk size (regulasi=800, jurnal=600, harga=250)
+│   │   ├── Content-hash re-index (R4) + BM25 cache invalidation
 │   │   └── Shares main_dataset collection with vectorCSV
 │   ├── vectorWeather.py             # Open-Meteo weather crawler
 │   │   ├── Fetches 92-day history + 16-day forecast
@@ -396,9 +401,10 @@ SUGI-v0.1L/
 │   ├── cli/
 │   │   └── main.py                  # Terminal chat client (persistent user ID)
 │   └── telegram/
-│       ├── telegram_bot.py          # Full Telegram bot (~550 lines)
+│       ├── telegram_bot.py          # Full Telegram bot (~580 lines)
 │       │   ├── Multi-user sessions
 │       │   ├── Offline message catch-up with offset persistence
+│       │   ├── Fail-closed debug access (R1) + global error handler (R3)
 │       │   ├── Rate limiting (3s per user)
 │       │   ├── Contact sharing
 │       │   └── Typing indicator
@@ -494,10 +500,13 @@ Evaluated on:
 
 > Full details live in: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (detailed chronological changelog — the **only** tracked file in `docs/`; the rest is internal-only) and [`docs/VERSIONS.md`](docs/VERSIONS.md) (concise overview, git-ignored).
 
-**Current status:** v0.2.0 (committed & pushed — HEAD `f53db8e`, 2026-08-12)
+**Current status:** v0.2.3 (uncommitted working tree; committed HEAD v0.2.0 — `3d5cdff`, 2026-08-12)
 
 | Version | Date | Status | Summary |
 |---|---|---|---|
+| **v0.2.3** | 2026-08-24 | ⏳ Working tree (T1–T2) | T1 whitespace normalization at `ask()` entry (fixes "hari  ini" double-space → false referential → Qwen timeout → memory injection); T2 data-narration removal: prompt hardening (silent gap-fill, silent history, forbidden-opener list, anti-refusal backstop) + runtime post-filter `_strip_data_narration()` strips "Saya tidak menemukan informasi", "Berdasarkan riwayat...", anti-refusal backstop |
+| **v0.2.2** | 2026-08-18 | ⏳ Working tree (N1, S1, S2) | N1 province metadata hoist for price insights (hoist `province` to chunk metadata + schema-versioned R4 reindex), S1 stemmed lexical eval overlap (Sastrawi `_stem_tokens`, graceful fallback, thresholds 0.50/0.25, thread lock), S2 scalability roadmap decision recorded (Option B: descoped Redis sessions + second Ollama at current scale) |
+| **v0.2.1** | 2026-08-12 | ⏳ Working tree (R1–R4 + Q1–Q2) | R1 fail-closed debug access (`DEBUG_ALLOWED_USERS` deny-by-default + startup warning), R2 `blocked_kw` enforced (blocked overrides allowed), R3 global Telegram error handler (fallback reply instead of silence), R4 content-hash re-index dedup (CSV/XLSX/PDF `file_hash`, delete+reindex on change) + BM25 invalidation backfill for PDFs, Q1 tag comments consolidated into `docs/decisions.md`, Q2 duplicated insight helpers extracted into shared `services/insight_common.py` (per-service k/label/truncation preserved) |
 | **v0.2.0** | 2026-08-12 | ✔ Committed (`f53db8e`) | Background eval (daemon thread), model residency `keep_alive=600`, eval stability (`num_ctx`/`num_predict`/timeout), parallel plant-detail fetch, scope-guard fix for `penanaman`, README DB schema (6 ChromaDB collections), `docs/CHANGELOG.md` changelog added & tracked, `tests/` git-ignored, A9 multi-turn history-poisoning fix, A8 insight-engine startup stagger (180/240/300s) + 240s LLM timeout, A10 retrieval-level memory gating + A4 closure (unfiltered `memory_retriever` removed), A11 startup-429 NameError fix + single-pass rerank + dead `include_weather`/`weather_retriever` removal + eval `num_predict=10`, A12 daily_insight concurrency backfill (pools → sequential `_run_paced` + `INSIGHT_LLM_DELAY`, `DAILY_INSIGHT_MAX_WORKERS` env) + A7 ping-retry (`_ping_with_retry` 5s/10s) |
 | **v0.1.9** | 2026-07-13 | ✔ Committed | Government & Farmer Insight Engines (+ChromaDB `government_memory`/`insights_memory`, MongoDB output) |
 | **v0.1.8** | 2026-06-03 | ✔ Committed | README/docs refresh + demo screenshots |
@@ -517,4 +526,4 @@ Evaluated on:
 ## License
 MIT License.
 
-Last updated: August 2026 · v0.1L (Scope-Hardened) · Changelog v0.2.0 · RAG Score 94/100
+Last updated: August 2026 · v0.1L (Scope-Hardened) · Changelog v0.2.3 · RAG Score 94/100

@@ -34,6 +34,11 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+if Path(__file__).resolve().parent.parent not in map(Path, sys.path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from services.insight_common import build_insight_llm, get_rag_context, get_weather_context, ping_with_retry
+
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
 
@@ -44,7 +49,7 @@ if not MONGO_URI:
 
 import certifi
 from pymongo import MongoClient, ReplaceOne
-from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
+from pymongo.errors import PyMongoError
 
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
@@ -133,27 +138,6 @@ def _ask_llm(llm: OllamaLLM, prompt: str) -> str:
         return ""
 
 
-def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
-    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
-
-    Atlas kadang transient "No primary found" saat pemilihan topologi baru
-    selesai (ServerSelectionTimeoutError). Dulu __init__ ping sekali tanpa
-    retry dan hanya mengandalkan restart proses luar di start_all.py — ini
-    menambahkan lapisan retry di dalam service sendiri.
-    """
-    for attempt in range(attempts):
-        try:
-            mongo.admin.command("ping")
-            return
-        except ServerSelectionTimeoutError as e:
-            if attempt == attempts - 1:
-                raise
-            wait = base_wait * (attempt + 1)
-            print(f"  GovInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
-                  f"retrying in {wait}s: {e}")
-            time.sleep(wait)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CORE ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
@@ -174,7 +158,7 @@ class GovernmentInsightEngine:
             tlsAllowInvalidCertificates=False,
             retryWrites=True,
         )
-        _ping_with_retry(self._mongo)
+        ping_with_retry(self._mongo, label="GovInsight")
         print("  GovInsight: MongoDB connected.")
 
         self._source_db = self._mongo["test"]
@@ -187,13 +171,7 @@ class GovernmentInsightEngine:
         print("  GovInsight: Index ensured on governmentinsights.sourceCollection.")
 
         # — LLM —
-        self._llm = OllamaLLM(
-            model=MODEL_NAME,
-            temperature=0.3,
-            repeat_penalty=1.1,
-            num_ctx=4096,
-            client_kwargs={"timeout": 240},  # A8: insight generate menjalankan banyak invoke — 90s terlalu ketat saat Ollama sedang sibuk
-        )
+        self._llm = build_insight_llm(MODEL_NAME, temperature=0.3)
         print(f"  GovInsight: LLM ready ({MODEL_NAME}).")
 
         # — ChromaDB (government memory) —
@@ -318,12 +296,11 @@ class GovernmentInsightEngine:
                 else:
                     self._process_if_changed(col_name)
             except Exception as e:
-                # A1: sebut tipe exception + nama field agar diagnosable satu baris
+                # A1: sebut tipe exception + nama field agar diagnosable. See docs/decisions.md#a1
                 print(f"  [ERROR] {col_name}: {type(e).__name__}: {e} (field: tahun)")
                 traceback.print_exc()
             finally:
-                # M0b: jeda antar LLM call — jangan banjiri Ollama lokal saat
-                # full refresh (chatbot & embedding ikut pakai mesin yang sama).
+                # M0b: jeda antar LLM call. See docs/decisions.md#m0
                 if i < len(SOURCE_COLLECTIONS) - 1 and INSIGHT_LLM_DELAY > 0:
                     time.sleep(INSIGHT_LLM_DELAY)
 
@@ -398,8 +375,8 @@ class GovernmentInsightEngine:
         parts = [f"Koleksi: {col_name}", f"Jumlah dokumen: {total}", f"Kolom: {', '.join(fields)}"]
 
         if "tahun" in fields:
-            # A1: distinct("tahun") bisa berisi campuran None/str/int — sort
-            # dgn None diffilter + normalisasi str agar tidak TypeError '<'.
+            # A1: distinct("tahun") bisa campuran None/str/int — sort aman.
+            # See docs/decisions.md#a1
             raw_years = col.distinct("tahun")
             years = sorted(
                 (y for y in raw_years if y is not None),
@@ -466,28 +443,12 @@ class GovernmentInsightEngine:
         return "\n".join(parts)
 
     def _get_rag_context(self, theme: str) -> str:
-        try:
-            from services.vectorCSV import vector_store as _vs
-            docs = _vs.similarity_search(theme, k=3)
-            if docs:
-                return "KONTEKS DARI BASIS PENGETAHUAN PERTANIAN:\n" + "\n".join(
-                    d.page_content[:300] for d in docs
-                )
-        except Exception:
-            pass
-        return ""
+        return get_rag_context(
+            theme, k=3, label="KONTEKS DARI BASIS PENGETAHUAN PERTANIAN:", content_chars=300
+        )
 
     def _get_weather_context(self) -> str:
-        try:
-            from services.vectorWeather import weather_store as _ws
-            docs = _ws.similarity_search("cuaca pertanian Indonesia", k=2)
-            if docs:
-                return "KONDISI CUACA TERKINI:\n" + "\n".join(
-                    d.page_content[:400] for d in docs
-                )
-        except Exception:
-            pass
-        return ""
+        return get_weather_context(k=2, label="KONDISI CUACA TERKINI:", content_chars=400)
 
     # ─── Insight Generation ─────────────────────────────────────────────
 

@@ -35,6 +35,11 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 
+if Path(__file__).resolve().parent.parent not in map(Path, sys.path):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from services.insight_common import build_insight_llm, get_plant_context, get_rag_context, get_weather_context, ping_with_retry
+
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
 
@@ -45,9 +50,8 @@ if not MONGO_URI:
 
 import certifi
 from pymongo import MongoClient, ReplaceOne
-from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
+from pymongo.errors import PyMongoError
 
-from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 
@@ -67,8 +71,7 @@ POLICY_MAX_CHARS = 500
 DAILY_INTERVAL = 86400
 CHANGE_CHECK_INTERVAL = 3600
 
-# M0: jeda antar LLM call + startup grace — jangan banjiri Ollama lokal saat
-# full refresh (chatbot & embedding ikut pakai mesin yang sama).
+# M0: jeda antar LLM call + startup grace. See docs/decisions.md#m0
 INSIGHT_LLM_DELAY = float(os.getenv("INSIGHT_LLM_DELAY", "1"))
 STARTUP_GRACE_SECONDS = int(os.getenv(
     "FARMER_INSIGHT_GRACE_SECONDS",
@@ -241,27 +244,6 @@ TULIS SATU PARAGRAF REKOMENDASI ({min_chars}-{max_chars} karakter — tanpa list
 # ENGINE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
-    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
-
-    Atlas kadang transient "No primary found" saat pemilihan topologi baru
-    (ServerSelectionTimeoutError). Dulu __init__ ping sekali tanpa retry dan
-    hanya mengandalkan restart proses luar di start_all.py — tambahkan retry
-    di dalam service sendiri (sama seperti government_insight_service).
-    """
-    for attempt in range(attempts):
-        try:
-            mongo.admin.command("ping")
-            return
-        except ServerSelectionTimeoutError as e:
-            if attempt == attempts - 1:
-                raise
-            wait = base_wait * (attempt + 1)
-            print(f"  FarmerInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
-                  f"retrying in {wait}s: {e}")
-            time.sleep(wait)
-
-
 class FarmerInsightEngine:
 
     def __init__(self):
@@ -278,7 +260,7 @@ class FarmerInsightEngine:
             tlsAllowInvalidCertificates=False,
             retryWrites=True,
         )
-        _ping_with_retry(self._mongo)
+        ping_with_retry(self._mongo, label="FarmerInsight")
         self._source_db = self._mongo["test"]
         self._target_sugi = self._mongo["sugi_insights"]
         self._target_test = self._mongo["test"]
@@ -291,13 +273,7 @@ class FarmerInsightEngine:
         print("  FarmerInsight: MongoDB ready, indexes ensured.")
 
         # ── LLM ──
-        self._llm = OllamaLLM(
-            model=MODEL_NAME,
-            temperature=0.3,
-            repeat_penalty=1.1,
-            num_ctx=4096,
-            client_kwargs={"timeout": 240},  # A8: insight generate menjalankan banyak invoke — 90s terlalu ketat saat Ollama sedang sibuk
-        )
+        self._llm = build_insight_llm(MODEL_NAME, temperature=0.3)
         print(f"  FarmerInsight: LLM ready ({MODEL_NAME}).")
 
         # ── ChromaDB ──
@@ -377,39 +353,15 @@ class FarmerInsightEngine:
     # ─── SUGI Ecosystem ─────────────────────────────────────────────────
 
     def _get_rag_context(self, query: str) -> str:
-        try:
-            from services.vectorCSV import vector_store as _vs
-            docs = _vs.similarity_search(query, k=2)
-            if docs:
-                return "PENGETAHUAN PERTANIAN:\n" + "\n".join(d.page_content[:250] for d in docs)
-        except Exception:
-            pass
-        return ""
+        return get_rag_context(
+            query, k=2, label="PENGETAHUAN PERTANIAN:", content_chars=250
+        )
 
     def _get_weather_context(self) -> str:
-        try:
-            from services.vectorWeather import weather_store as _ws
-            docs = _ws.similarity_search("cuaca pertanian Indonesia", k=2)
-            if docs:
-                return "KONDISI CUACA:\n" + "\n".join(d.page_content[:300] for d in docs)
-        except Exception:
-            pass
-        return ""
+        return get_weather_context(k=2, label="KONDISI CUACA:", content_chars=300)
 
     def _get_plant_context(self, commodity: str) -> str:
-        try:
-            import chromadb as _cdb
-            from langchain_chroma import Chroma
-            from langchain_ollama import OllamaEmbeddings
-            _client = _cdb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-            _emb = OllamaEmbeddings(model=EMBED_MODEL)
-            _pc = Chroma(collection_name="plant_data", client=_client, embedding_function=_emb)
-            docs = _pc.similarity_search(commodity, k=1)
-            if docs:
-                return f"INFO TANAMAN:\n{docs[0].page_content[:300]}"
-        except Exception:
-            pass
-        return ""
+        return get_plant_context(commodity, CHROMA_HOST, CHROMA_PORT, EMBED_MODEL)
 
     # ═════════════════════════════════════════════════════════════════════
     # DATA AGGREGATION — Farmer Insights

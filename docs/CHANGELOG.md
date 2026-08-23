@@ -19,6 +19,206 @@ Legend for source of each entry:
 
 ---
 
+## `v0.2.3` — 2026-08-24 — Live-bug fixes: whitespace masking + data-narration openers (T1, T2) [inferred]
+
+**Status:** working-tree changes (uncommitted; live-findings round, on top of the
+v0.2.2 N1/S1/S2 section below).
+
+### Summary
+Two production bugs fixed from live Telegram logs: (T1) irregular whitespace
+defeated time-phrase masking, causing false referential detection and wasted
+30-second Qwen rewrite timeouts; (T2) model narrated data gaps ("Saya tidak
+temukan informasi...") and announced history usage instead of answering
+silently — fixed via prompt hardening + runtime post-filter.
+
+### Detailed changes
+- **T1 — whitespace normalization** — `core/sugi_core.py`
+  User input is now normalized at the entry point of `ask()`:
+  `re.sub(r"\s+", " ", question).strip()` collapses any run of whitespace
+  (double spaces, tabs, newlines) into a single space before any downstream
+  exact-substring matcher runs. This makes `_TIME_PHRASES` masking,
+  `_ref_words`/`_ref_suffixes` matching, `WEATHER_KEYWORDS`,
+  `_PLANTING_SUITABILITY_PHRASES`, `_CULTIVATION_SIGNALS`, and
+  `_is_in_scope` keyword matching robust against mobile-keyboard artifacts
+  (e.g. `"hari  ini"` → `"hari ini"`). Fixes the root cause of three symptoms
+  simultaneously: garbled non-answer, wasted 30s Qwen timeout, and irrelevant
+  memory injection from week-old conversations.
+
+- **T2 — remove data-narration openers** — `core/sugi_core.py`, `requirements.txt`
+  **Prompt hardening (4 edits to `_ANSWER_TEMPLATE_BASE`):**
+  1. Silent gap-fill: "jawab dari pengetahuan umum **TANPA menyebutkan bahwa data
+     spesifik tidak tersedia atau menjelaskan proses pencarianmu**"
+  2. Silent history usage: "**TANPA menyebutkan secara eksplisit bahwa kamu
+     sedang menggunakan riwayat percakapan tersebut**"
+  3. Explicit forbidden-opener list: "JANGAN membuka jawaban dengan menjelaskan
+     sumber... (contoh DILARANG: 'Saya tidak menemukan informasi...', 'Saya tidak
+     memiliki informasi...', 'Sumber data yang relevan...', 'Berdasarkan
+     riwayat percakapan...')"
+  4. Anti-refusal backstop: "JANGAN PERNAH menjawab bahwa tidak ada pertanyaan
+     yang diajukan... JANGAN menolak menjawab pertanyaan pertanian dengan alasan
+     tidak ada data cuaca, 'bukan tanggung jawabku', atau 'hubungi petugas lain'"
+
+  **Runtime post-filter (`_strip_data_narration`):**
+  Strips any leading forbidden phrase (`"Saya tidak menemukan informasi"`,
+  `"Saya tidak memiliki informasi"`, `"Sumber data yang relevan"`,
+  `"Berdasarkan riwayat percakapan"`, `"Tidak ada pertanyaan yang diajukan"`) at
+  runtime as a safety net if the model ignores prompt instructions. Applied to
+  both the success path and error path of `ask()`.
+
+### Files affected
+`core/sugi_core.py`, `requirements.txt`, `docs/decisions.md`, `docs/CHANGELOG.md`.
+
+---
+
+## `v0.2.2` — 2026-08-18 — Final-review round (N1, S1, S2) [inferred]
+
+**Status:** working-tree changes (uncommitted; Phase-3 final-review round, on top
+of the v0.2.1 R1–R4 and Q1–Q2 sections below).
+
+### Summary
+One real bug fixed from the live-log analysis (N1 — price insights collapsing to
+a single "Nasional" bucket), one design-level improvement shipped (S1 —
+Indonesian stemming in the eval loop, with re-validated thresholds), and one
+recorded decision (S2 — both scalability ceilings explicitly descoped at current
+scale).
+
+### Detailed changes
+- **N1 — province metadata hoist** — `services/vectorCSV.py`,
+  `services/vectorpdf.py`, `services/daily_insight.py` (consumer already read
+  the key)
+  `generate_price_insights` grouped by `meta.province`, but
+  `process_dataframe()` never wrote it — every price document landed in the
+  `"Nasional"` bucket, so ~40k docs produced ONE insight instead of one per
+  province. Fix: hoist the province column into chunk metadata using the same
+  candidate list as `farmer_insight_service._province_field()`; add
+  `_METADATA_SCHEMA_VERSION = "v2"` into the R4 content hashes (CSV + PDF) so
+  the metadata schema change triggers exactly one deliberate full reindex via
+  R4's delete+reindex mechanism (schedule in a low-traffic window).
+- **S1 — stemmed lexical eval overlap** — `core/eval_loop.py`,
+  `requirements.txt`
+  `_lexical_faithfulness` / `_lexical_relevance` now reduce tokens to stems via
+  Sastrawi (`_stem_tokens`, graceful fallback if the package is absent) so
+  morphological variants ("menanam" ↔ "penanaman") count as overlap — fewer
+  false `LOW` flags and fewer wasted background LLM eval calls. Thresholds
+  re-validated against `data/logs/queries.jsonl`: faithfulness raised
+  **0.40/0.20 → 0.50/0.25** (false-HIGH drops 5→3 on the LLM-resolved sample);
+  relevance kept at 0.50/0.25. Shared stemmer guarded with a lock (eval runs on
+  a background thread, C1).
+- **S2 — scalability decision (descope)** — no code change; decision recorded in
+  `docs/decisions.md#s2`. Session state stays single-process-in-memory and
+  Ollama stays single-instance; reinvest in Redis-backed sessions / a second
+  Ollama daemon only if traffic actually demands it.
+
+### Files affected
+`core/eval_loop.py`, `requirements.txt`, `services/vectorCSV.py`,
+`services/vectorpdf.py`, `services/daily_insight.py`,
+`docs/decisions.md`, `docs/CHANGELOG.md`.
+
+---
+
+## `v0.2.1` — 2026-08-12 — Sec/correctness hardening (R1–R4) [inferred]
+
+**Status:** working-tree changes (uncommitted; Phase-1 code review round).
+
+### Summary
+Four security/correctness bugs closed from a structured review:
+fail-open debug access, dormant blocked-topic list, unhandled-telegram
+exceptions, and filename-only re-index dedup.
+
+### Detailed changes
+- **R1 — fail-closed debug access** — `interfaces/telegram/telegram_bot.py`
+  `DEBUG_ALLOWED_USERS` previously used `if DEBUG_ALLOWED_USERS and user_id not
+  in ...` — with the env var unset (empty string) the guard never fired, so
+  **all** users got `/debug` and `!`-commands. Both gates
+  (`cmd_debug()` and the `!`-command branch in `handle_message()`) are now
+  deny-by-default (`if user_id not in DEBUG_ALLOWED_USERS`). A one-time
+  startup warning prints when the variable is unset. CLI `handle_debug_command`
+  intentionally left ungated (known gap).
+- **R2 — enforce blocked-topics list** — `core/sugi_core.py`,
+  `config/settings/scope_config.ini`
+  `self.blocked_kw` (43 keywords) was loaded but never read by
+  `_is_in_scope()`. `_is_in_scope()` now checks `blocked_kw` **first** —
+  blocked overrides allowed (a query like "apakah padi bisa mengobati
+  diabetes?" now refuses). The 43-term blocked list was reviewed before
+  enabling; no agriculture false-positives. Validated live against the real
+  config (mixed allowed+blocked queries → BLOCKED).
+- **R3 — global Telegram error handler** — `interfaces/telegram/telegram_bot.py`
+  No `add_error_handler(...)` was registered, so exceptions thrown outside
+  `SugiCore.ask()`'s internal try/except (e.g. failure inside `_send_long`)
+  left the user with silence. Added `_global_error_handler` (logs traceback +
+  best-effort "⚠️ Maaf, terjadi kesalahan tak terduga…" reply) and registered
+  it before `run_polling()`. Runtime-verified with a stub PTB `Application`:
+  forced `_send_long` raise → fallback message delivered, normal answer did
+  not leak.
+- **R4 — content-hash indexing dedup** — `services/vectorCSV.py`,
+  `services/vectorpdf.py`
+  `index_file()` deduped by filename only (`where={"source": file_name}`), so
+  an edit to an already-indexed file was never re-indexed. Now each chunk
+  carries a `file_hash` metadata; on a hash mismatch the old chunks are
+  deleted (`vector_store.delete`) and the file/sheet re-indexed. Helpers
+  `_file_content_hash` (MD5, 8KiB chunks) / `_df_content_hash` (per-sheet CSV
+  repr) / `_stored_hash`. CSV: `file_hash` added to `base_metadata`;
+  XLSX: per-sheet hash. Also **backfilled BM25 invalidation for PDFs**:
+  `vectorpdf.py` had no `invalidate_bm25_cache()` at all — added the helper
+  and call it on every successful PDF index (new or changed), matching the
+  CSV/XLSX service. Runtime-verified with fake vector stores: new →
+  invalidate; changed-content → delete + reindex + invalidate; unchanged →
+  no-op.
+
+### Files affected
+`core/sugi_core.py`, `interfaces/telegram/telegram_bot.py`,
+`services/vectorCSV.py`, `services/vectorpdf.py`,
+`docs/CHANGELOG.md`, `docs/VERSIONS.md`, `README.md`,
+`config/.env.example`
+(+ runtime-data drift: `data/telegram_offset.json`).
+
+---
+
+## `v0.2.1` — 2026-08-12 — Phase-2 maintainability (Q1–Q2) [inferred]
+
+**Status:** working-tree changes (uncommitted; Phase-2 code-quality round, on top
+of the R1–R4 section above).
+
+### Summary
+Two maintainability cleanups: consolidating the per-fix inline "tag" comments
+into a single decision log, and de-duplicating the three insight services'
+shared helpers into one module that preserves each call site's behavior.
+
+### Detailed changes
+- **Q1 — tag soup consolidated** — `docs/decisions.md` (new, tracked),
+  inline comments across `core/`, `services/`, `interfaces/`
+  Every A–R tag from Stages 1–5 and Phase 1 now has one section in a decision
+  log organized by phase. Inline comments were trimmed to a one-line pointer
+  (`# TAG: brief — see docs/decisions.md#tagname`) with tags unchanged as the
+  code↔log anchor. Two-way cross-check verified (every code tag has a section,
+  every section has a code tag; added missing anchors incl. `C4` in
+  `plant_api.py` and an `A10` anchor at the `mem_future` gate +
+  memory-merge site in `sugi_core.py`). All touched files `py_compile` clean;
+  serverless sanity tests (`A5`, `A11`) still pass.
+- **Q2 — shared `services/insight_common.py`** — new file plus
+  `services/daily_insight.py`, `services/farmer_insight_service.py`,
+  `services/government_insight_service.py`
+  Replaced the three independent copies of `_ping_with_retry`, the
+  `OllamaLLM(..., timeout=240)` construction, and the `_get_rag_context` /
+  `_get_weather_context` / `_get_plant_context` helpers with shared functions:
+  `ping_with_retry(mongo, label)`, `build_insight_llm(model, temperature)`,
+  `get_rag_context`, `get_weather_context`, `get_plant_context`. Each service
+  now passes its own `k` / label prefix / truncation length /
+  temperature explicitly (farmer k=2 + `PENGETAHUAN PERTANIAN:` + 250 chars;
+  gov k=3 + `KONTEKS…` + 300 chars and weather 400 chars; daily keeps temp
+  0.4), so generated insight text is byte-identical. `insight_common.py`
+  never imports from the three services (one-way dependency; no circular
+  imports). Unused `OllamaLLM` / `ServerSelectionTimeoutError` imports removed.
+
+### Files affected
+`docs/decisions.md` (new), `services/insight_common.py` (new),
+`core/sugi_core.py`, `core/eval_loop.py`, `core/plant_api.py`,
+`interfaces/telegram/telegram_bot.py`, `services/vectorCSV.py`,
+`services/vectorpdf.py`, `services/daily_insight.py`,
+`services/farmer_insight_service.py`,
+`services/government_insight_service.py`, `.gitignore`,
+`docs/CHANGELOG.md`.
+
 ## `v0.2.0` — 2026-08-12 — Optimization, latency & correctness hardening [git]
 
 **Status:** committed & pushed to `origin/main` as `f53db8e`
@@ -373,6 +573,7 @@ Modelfile, document ingestion and question generation.
 ## Git history index (commit → version, reconstructed)
 
 ```
+2026-08-12  (uncommitted working tree)              → v0.2.1
 2026-08-12  f53db8e                       → v0.2.0
 2026-07-13  cd6f42b / 6fb410c / cc94e4c  → v0.1.9
 2026-06-03  d8b10fa                       → v0.1.8

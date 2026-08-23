@@ -16,6 +16,9 @@ chromadb>=0.5
 # Embeddings / Reranker
 sentence-transformers>=3.0
 
+# Indonesian Stemmer (S1: lexical eval overlap; degrades gracefully if absent)
+Sastrawi>=1.0.1
+
 # BM25
 rank_bm25>=0.2
 

@@ -113,11 +113,7 @@ _REWRITE_ANSWER_MARKERS = [
 ]
 
 
-# O3: frasa waktu tetap yang TIDAK boleh di-rewrite.
-# "hari ini" bukan referensial — "ini" di dalamnya adalah bagian idiom, bukan
-# rujukan ke subjek dari history. Tanpa guard ini rule-based rewriter
-# mengganti "ini" → subjek ("harga cabe hari ini" → "harga cabe {subjek}"),
-# yang lalu bisa salah mendeteksi cuaca (mis. subjek = "kelembaban").
+# O3: frasa waktu tetap yang TIDAK boleh di-rewrite. See docs/decisions.md#o3
 _TIME_PHRASES = (
     "hari ini", "malam ini", "minggu ini", "bulan ini", "tahun ini",
     "saat ini", "waktu ini",
@@ -127,12 +123,7 @@ _TIME_PHRASES = (
 
 
 def _round_time(now: datetime) -> str:
-    """O2: bulatkan waktu (HH:MM) ke 5 menit terdekat.
-
-    Prefix-cache Ollama TERBUKTI aktif secara empiris di instalasi lokal
-    (tests/test_stage4_o2.py): request ber-prefix identik ~21% lebih cepat.
-    Membulatkan timestamp memperbanyak kesempatan nge-share prefix antar
-    query serupa; akurasi "informasi sesi saat ini" tetap baik (±2.5 menit).
+    """O2: bulatkan waktu ke 5 menit terdekat (prefix-cache). See docs/decisions.md#o2
     """
     total   = now.hour * 60 + now.minute
     rounded = ((total + 2) // 5) * 5
@@ -232,26 +223,36 @@ _ANSWER_TEMPLATE_BASE = (
     "1. SUMBER DATA & KONTEKS\n"
     "   - Jika pertanyaan merujuk ke jawaban sebelumnya (contoh: 'kenapa pupuk diatas', "
     "'bagaimana cara merawatnya', 'jelaskan lebih lanjut'), WAJIB gunakan riwayat "
-    "percakapan di atas sebagai referensi utama.\n"
+    "percakapan di atas sebagai referensi utama — TANPA menyebutkan secara eksplisit "
+    "bahwa kamu sedang menggunakan riwayat percakapan tersebut.\n"
     "   - Jika data berisi informasi cuaca, WAJIB gunakan dan sebut angkanya "
     "(suhu, curah hujan, kelembaban, dll.).\n"
     "   - Jika data berisi informasi harga, sebutkan harga spesifik dan tanggalnya.\n"
     "   - Jika data berisi panduan budidaya, kutip langkah yang relevan saja.\n"
-    "   - Jika data TIDAK relevan atau kosong, jawab dari pengetahuan umum dan "
-    "beritahu user bahwa data spesifik tidak tersedia.\n\n"
+    "   - Jika data TIDAK relevan atau kosong, jawab langsung dari pengetahuan umum "
+    "pertanian TANPA menyebutkan bahwa data spesifik tidak tersedia atau menjelaskan "
+    "proses pencarianmu — jawab seolah itu memang pengetahuanmu sendiri.\n\n"
     "2. FORMAT JAWABAN\n"
     "   - Langsung jawab tanpa sapaan pembuka (tidak perlu \"Halo!\" atau "
     "\"Tentu saja!\").\n"
     "   - JANGAN meniru format dialog (jangan menulis ulang 'User:' atau 'Sugi:').\n"
     "   - JANGAN menyebutkan \"tidak tersedia di database\" jika data relevan "
     "telah diberikan di atas.\n"
+    "   - JANGAN membuka jawaban dengan menjelaskan sumber atau ketersediaan data "
+    "(contoh yang DILARANG: 'Saya tidak menemukan informasi tentang...', 'Saya tidak "
+    "memiliki informasi tentang...', 'Sumber data yang relevan untuk pertanyaan ini "
+    "adalah...', 'Berdasarkan riwayat percakapan...'). Langsung jawab isi pertanyaan.\n"
+    "   - JANGAN PERNAH menjawab bahwa tidak ada pertanyaan yang diajukan — pertanyaan "
+    "pengguna SELALU tersedia di bagian \"Pertanyaan saat ini\" di bawah.\n"
+    "   - JANGAN menolak menjawab pertanyaan pertanian dengan alasan tidak ada data "
+    "cuaca, 'bukan tanggung jawabku', atau 'hubungi petugas lain' — jawablah dengan "
+    "pengetahuan pertanian umum yang relevan.\n"
     "   - Gunakan bullet points HANYA jika ada 3 item atau lebih yang perlu "
     "disebutkan (langkah, syarat, daftar).\n"
     "   - Maksimal 1 tingkat kedalaman bullet — JANGAN buat sub-poin bertingkat "
     "(a, b, c, i, ii, dst.).\n"
     "   - Untuk 1–2 poin: cukup gunakan kalimat biasa.\n"
-    "   - Panjang ideal: 3–6 kalimat untuk pertanyaan sederhana, maksimal 10 "
-    "baris untuk pertanyaan kompleks.\n"
+    "   - Maksimal 10 baris untuk pertanyaan kompleks.\n"
     "   - Jangan mengulang kalimat yang sudah disebutkan.\n"
     "   - Akhiri jawaban tepat setelah selesai menjelaskan — tidak perlu penutup "
     "seperti \"Semoga membantu!\"\n"
@@ -292,16 +293,16 @@ class SugiCore:
             model          = LLM_MODEL,
             temperature    = 0.3,
             repeat_penalty = 1.15,
-            keep_alive     = 600,   # residensi 10 menit — hindari reload tiap query (C2)
-            num_ctx        = 4096,  # context ceiling konsisten dgn stability guard (C3)
-            num_predict    = 512,   # batas maksimum token output (C3)
+            keep_alive     = 600,   # residensi 10 menit (C2) — see docs/decisions.md#c2
+            num_ctx        = 4096,  # stability guard (C3)
+            num_predict    = 512,   # batas token output (C3)
         )
         self.rewrite_model = OllamaLLM(
             model          = UTILITY_MODEL,
             temperature    = 0,
-            keep_alive     = 600,   # disamakan dgn self.model (C2: residency)
-            num_predict    = 40,    # batas maksimum token rewrite (B1: bounded worst-case cost)
-            client_kwargs  = {"timeout": 30},  # D2: timeout via httpx client, bukan kwarg diam-diam
+            keep_alive     = 600,   # seragam dgn self.model (C2)
+            num_predict    = 40,    # bounded worst-case cost (B1)
+            client_kwargs  = {"timeout": 30},  # D2: timeout via httpx client
         )
 
         # ── Memory store ──────────────────────────────────────────────────────
@@ -364,8 +365,7 @@ class SugiCore:
         # ── Reranker ──────────────────────────────────────────────────────────
         print("🧠  Loading Reranker...")
         _reranker = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-        # M1: top_n naik ke 8 agar hasil rerank gabungan weather+RAG muat
-        # di 6–8 chunk (dibatasi final di ask() lewat all_docs[:8]).
+        # M1: top_n=8 agar hasil rerank weather+RAG muat. See docs/decisions.md#m1
         self.compressor = CrossEncoderReranker(model=_reranker, top_n=8)
 
         # ── Config files ──────────────────────────────────────────────────────
@@ -393,11 +393,7 @@ class SugiCore:
         )
 
         # ── Plant fallback chain ──────────────────────────────────────────────
-        # A6: num_predict dipasang via CONSTRUCTOR, bukan .bind(). Langchain-ollama
-        # 1.0.1 meneruskan kwarg bend() polos ke Client.generate() yang menolaknya
-        # ("Client.generate() got an unexpected keyword argument 'num_predict'"),
-        # jadi fallback plant-name diam-diam mati. Pola konstruktor inilah yang
-        # sudah terbukti bekerja untuk self.model (num_predict=512) & self.rewrite_model.
+        # A6: num_predict via CONSTRUCTOR, bukan .bind(). See docs/decisions.md#a6
         self._plant_extract_model = OllamaLLM(
             model          = UTILITY_MODEL,
             temperature    = 0,
@@ -417,8 +413,7 @@ class SugiCore:
         )
 
         # ── Bounded caches (per-process, thread-safe) ─────────────────────────
-        # B1: rewrite Qwen results — key = (normalized question, history fingerprint)
-        # B2: plant-name extraction — key = normalized question
+        # B1: rewrite Qwen cache; B2: plant-extraction cache. See docs/decisions.md#b1 #b2
         self._rewrite_cache: dict[tuple[str, str], str] = {}
         self._rewrite_cache_lock = threading.Lock()
         self._plant_extract_cache: dict[str, str | None] = {}
@@ -439,12 +434,17 @@ class SugiCore:
         Proses pertanyaan dari user dan kembalikan jawaban sebagai string.
         Dipakai oleh CLI (main.py) dan Telegram (telegram_bot.py).
         """
+        # T1: normalize whitespace upfront so all downstream exact-substring
+        # phrase matchers (_TIME_PHRASES, WEATHER_KEYWORDS, etc.) are robust
+        # against double spaces, tabs, newlines from mobile keyboards.
+        question = re.sub(r"\s+", " ", question).strip()
+
         session           = self._get_or_create_session(user_id)
         trace             = new_query_trace(session["session_id"])
         trace["question"] = question
         is_greeting_q     = self._is_greeting(question)
 
-        _local_start = time.monotonic()  # D1: ukur waktu ask() secara mandiri (tidak pakai field trace)
+        _local_start = time.monotonic()  # D1: ukur ask() mandiri. See docs/decisions.md#d1
 
         full_response = ""
         error_msg     = None
@@ -458,8 +458,7 @@ class SugiCore:
             has_history  = len(session["history"]) > 0
 
             # ── [1.1] Query Rewriting ─────────────────────────────────────────
-            # D3: Qwen tidak pernah dibayar untuk pertanyaan yang sudah pasti
-            # out-of-scope. Hanya rule-based (suffix) yang boleh me-bypass scope.
+            # D3: Qwen tidak dibayar untuk out-of-scope. See docs/decisions.md#d3
             if in_scope:
                 standalone_query, rewrite_type = self._maybe_rewrite(question, history_text)
             else:
@@ -478,11 +477,7 @@ class SugiCore:
                 commit_trace(trace)
                 return self.refusal_msg
 
-            # A9: Hanya suntikkan history ke prompt jika pertanyaan BENAR-BENAR
-            # merujuk ke giliran sebelumnya (rewriter mendeteksi sinyal referensial).
-            # Pertanyaan baru yang mandiri (rewrite_type=="none") tidak boleh
-            # melihat teks jawaban lama di context — jika tidak, tema jawaban lama
-            # (mis. "apel") mencemari topik baru (mis. tanam bulan Desember / salak).
+            # A9: history disuntik hanya untuk pertanyaan referensial. See docs/decisions.md#a9
             needs_ref_context = self._needs_ref_context(rewrite_type)
             prompt_history = self._select_prompt_history(rewrite_type, history_text)
             print(f"🔍  Query: {standalone_query}")
@@ -532,13 +527,10 @@ class SugiCore:
                 include_plant   = include_plant,
             )
 
-            # B4: embed sekali, dipakai ulang untuk weather & memory — menghapus
-            # embedding call redundan (tiap similarity_search dulu re-embed).
+            # B4: embed sekali, reuse untuk weather & memory. See docs/decisions.md#b4
             query_vec = embeddings.embed_query(standalone_query)
 
-            # B5: jalankan pencarian independen secara paralel — wall-clock
-            # mendekati call terlama, bukan jumlah seluruh call. Merge/dedup
-            # tetap berurutan di bawah (hasil retrieval identik dgn versi sekuensial).
+            # B5: pencarian independen paralel. See docs/decisions.md#b5
             weather_docs, rag_docs, mem_docs = [], [], []
             with ThreadPoolExecutor(max_workers=3) as pool:
                 weather_future = (
@@ -549,6 +541,8 @@ class SugiCore:
                     else None
                 )
                 rag_future = pool.submit(retriever_obj.invoke, standalone_query)
+                # A10: memory search & merge hanya utk pertanyaan referensial (pintang A9)
+                # — bukan flag has_history yang kasar. See docs/decisions.md#a10
                 mem_future = (
                     pool.submit(
                         self.memory_store.similarity_search_by_vector,
@@ -568,13 +562,10 @@ class SugiCore:
                     except Exception as _mem_err:
                         print(f"   ⚠️  Memory recall error: {_mem_err}")
 
-            # A11/M1: retriever ensemble kini TANPA compression wrapper, jadi
-            # SEMUA kandidat (RAG ± weather) di-rerank TEPAT SATU KALI di sini —
-            # konsisten untuk query ber-cuaca maupun tidak, tidak ada double
-            # rerank untuk bagian RAG.
+            # A11/M1: ensemble TANPA compression wrapper → rerank TEPAT SATU KALI di sini.
+            # See docs/decisions.md#a11
             combined_candidates = weather_docs + rag_docs
-            # O1: ukur biaya reranker dalam isolasi (compress_documents) untuk
-            # memutuskan apakah layak di-skip untuk query sederhana.
+            # O1: ukur biaya reranker dalam isolasi. See docs/decisions.md#o1
             _t_rerank = time.monotonic()
             reranked = list(self.compressor.compress_documents(
                 combined_candidates, standalone_query
@@ -595,6 +586,7 @@ class SugiCore:
             # ── [Fix 1] Inject long-term memory docs for returning users ──────
             # Memory docs are prepended (low priority) to give the LLM past
             # conversation context while keeping the retrieval signal dominant.
+            # A10: inject memory docs hanya utk referensial (merge gate). See docs/decisions.md#a10
             if needs_ref_context and mem_docs:
                 new_mem = [
                     d for d in mem_docs
@@ -606,8 +598,7 @@ class SugiCore:
                     all_docs = new_mem + all_docs   # memory first
                     print(f"💾  Injected {len(new_mem)} memory doc(s) from long-term store.")
 
-            # B8 (M2): cap context 8 chunk — weather+RAG kini sama-sama masuk,
-            # pastikan prompt tetap muat di num_ctx=4096.
+            # B8 (M2): cap context 8 chunk. See docs/decisions.md#b8
             all_docs = all_docs[:8]
 
             context = self._format_docs(all_docs) if all_docs else "Tidak ada data relevan di database."
@@ -625,6 +616,9 @@ class SugiCore:
                 "history":  prompt_history,
             }):
                 full_response += chunk
+
+            # T2 backup: strip forbidden data-narration openers
+            full_response = self._strip_data_narration(full_response)
 
             print(full_response)
             trace["answer_preview"] = full_response[:200]
@@ -658,15 +652,13 @@ class SugiCore:
 
         except Exception as e:
             error_msg     = str(e)
-            full_response = f"⚠️ Maaf, terjadi kesalahan: {e}"
+            full_response = self._strip_data_narration(f"⚠️ Maaf, terjadi kesalahan: {e}")
             print(f"\n❌  SugiCore error for {user_id}: {e}")
             # Jalur error: commit sinkron — tidak ada full_response yang
             # ditunggu, logging tetap harus langsung tercatat.
             commit_trace(trace, error=error_msg)
 
-        # D1: ukur berapa lama ask() (sampai response siap dikembalikan).
-        # Eval + commit_trace sudah di background thread — angka ini TIDAK
-        # termasuk waktu evaluasi LLM.
+        # D1: ukur latency ask() (tanpa eval). See docs/decisions.md#d1
         print(f"[TIMING] ask() returning after {time.monotonic() - _local_start:.2f}s")
         return full_response
 
@@ -916,15 +908,14 @@ class SugiCore:
         return q, rewrite_type
 
     def _mask_time_phrases(self, text: str) -> str:
-        """O3: blank-out frasa waktu tetap agar "ini/itu/tadi" di dalamnya
-        tidak dianggap referensial (karakter dijaga posisinya pakai spasi)."""
+        """O3: blank-out frasa waktu tetap. See docs/decisions.md#o3"""
         masked = text
         for ph in _TIME_PHRASES:
             masked = masked.replace(ph, " " * len(ph))
         return masked
 
     def _ref_in_time_phrase(self, ref: str, question: str) -> bool:
-        """O3: True jika kata referensial `ref` muncul DI DALAM frasa waktu tetap."""
+        """O3: True jika `ref` ada DI DALAM frasa waktu tetap. See docs/decisions.md#o3"""
         q_lower = question.lower()
         pat = re.compile(r"(?<![a-zA-Z])" + re.escape(ref) + r"(?![a-zA-Z])", re.IGNORECASE)
         for ph in _TIME_PHRASES:
@@ -985,10 +976,7 @@ class SugiCore:
     def _qwen_rewrite(self, question: str, history_text: str) -> str:
         """
         Qwen LLM fallback untuk query rewriting.
-        Dipanggil HANYA jika rule-based tidak bisa resolve.
-        Timeout 30 detik — jika gagal/timeout, return original question.
-        B1: hasil dicache (bounded, thread-safe) per (question, history fingerprint)
-        agar pertanyaan referensial yang sama tidak membayar Qwen berulang kali.
+        B1: hasil dicache bounded per (question, history fingerprint). See docs/decisions.md#b1
         """
         key = (question.strip().lower(), self._history_fingerprint(history_text))
         with self._rewrite_cache_lock:
@@ -1103,8 +1091,7 @@ class SugiCore:
                 print(f"   [plant-map] '{kw}' → '{mapped}'")
                 return mapped
 
-        # B2: cache hasil Qwen fallback per normalized question — jalur
-        # name-map di atas sudah murah, yang mahal adalah Qwen fallback.
+        # B2: cache Qwen fallback per normalized question. See docs/decisions.md#b2
         cache_key = question.strip().lower()
         with self._plant_extract_cache_lock:
             if cache_key in self._plant_extract_cache:
@@ -1161,6 +1148,34 @@ class SugiCore:
         )
         return ChatPromptTemplate.from_template(filled)
 
+    def _strip_data_narration(self, text: str) -> str:
+        """
+        T2 backup: strip forbidden data-narration openers that the model
+        sometimes emits despite prompt instructions. Repeatedly strips from
+        start-of-string (case-insensitive) until no forbidden prefix remains.
+        Only removes the forbidden phrase itself (+ optional comma/space), not
+        the rest of the sentence.
+        """
+        forbidden_prefixes = [
+            r"saya tidak menemukan informasi",
+            r"saya tidak memiliki informasi",
+            r"sumber data yang relevan",
+            r"berdasarkan riwayat percakapan",
+            r"tidak ada pertanyaan yang diajukan",
+        ]
+        stripped = text.lstrip()
+        changed = True
+        while changed:
+            changed = False
+            for pat in forbidden_prefixes:
+                # Match at start: forbidden phrase + optional comma/space
+                m = re.match(rf"(?i)^{re.escape(pat)}[,\s]*", stripped)
+                if m:
+                    stripped = stripped[m.end():]
+                    changed = True
+                    break  # restart loop after each strip
+        return stripped
+
     # ═══════════════════════════════════════════════════════════════════════════
     # RETRIEVER BUILDER
     # ═══════════════════════════════════════════════════════════════════════════
@@ -1171,11 +1186,8 @@ class SugiCore:
     ) -> EnsembleRetriever:
         """Bangun ensemble RAG retriever (tanpa compression wrapper).
 
-        A11/M1: weather tidak lagi masuk lewat retriever lain — ask() menariknya
-        manual dan menggabungkannya dengan RAG di SANA. Rerank cross-encoder
-        dijalankan TEPAT SATU KALI di merge point ask(); retriever ini sengaja
-        tidak dibungkus ContextualCompressionRetriever supaya RAG tidak
-        di-rerank dua kali pada query yang juga membawa weather docs.
+        A11/M1: weather di-merge manual di ask(); rerank tepat satu kali di
+        merge point. See docs/decisions.md#a11
         """
         retrievers = [self.primary_ensemble]
         weights    = [0.60]
@@ -1223,14 +1235,12 @@ class SugiCore:
         return "\n\n".join(lines)
 
     def _needs_ref_context(self, rewrite_type: str) -> bool:
-        """A9: pertanyaan butuh riwayat hanya bila rewriter mendeteksi sinyal
-        referensial (suffix/word/followup/qwen). Pertanyaan mandiri ("none")
-        tidak boleh tercemar topik jawaban sebelumnya."""
+        """A9: butuh riwayat hanya untuk pertanyaan referensial.
+        See docs/decisions.md#a9"""
         return rewrite_type not in ("none",)
 
     def _select_prompt_history(self, rewrite_type: str, history_text: str) -> str:
-        """A9: pilih teks history untuk di-suntik ke prompt. Untuk pertanyaan
-        mandiri history dikosongkan agar topik lama tidak memengaruhi jawaban."""
+        """A9: history dikosongkan utk pertanyaan mandiri. See docs/decisions.md#a9"""
         if self._needs_ref_context(rewrite_type):
             return history_text
         return "Belum ada riwayat percakapan."
@@ -1383,6 +1393,11 @@ class SugiCore:
 
     def _is_in_scope(self, question: str) -> bool:
         q = question.lower().strip()
+        # R2: blocked_kw diprioritaskan MENGALAHKAN allowed. See docs/decisions.md#r2
+        for kw in self.blocked_kw:
+            if _word_match(kw, q):
+                print(f"   [scope: blocked '{kw}' → BLOCKED]")
+                return False
         for p in self.greeting_patterns:
             if _word_match(p, q):
                 print(f"   [scope: greeting '{p}' → ALLOWED]")

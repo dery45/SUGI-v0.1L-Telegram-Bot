@@ -43,9 +43,9 @@ load_dotenv(_ROOT / "config" / ".env")
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "mxbai-embed-large")
-LATITUDE       = float(os.getenv("LATITUDE", "-6.1818"))
-LONGITUDE      = float(os.getenv("LONGITUDE", "106.8223"))
-LOCATION_NAME  = os.getenv("LOCATION_NAME", "Jakarta")
+LATITUDE       = float(os.getenv("LATITUDE", "-7.774756"))
+LONGITUDE      = float(os.getenv("LONGITUDE", "110.388836"))
+LOCATION_NAME  = os.getenv("LOCATION_NAME", "Yogyakarta")
 
 PAST_DAYS      = int(os.getenv("PAST_DAYS", "92"))
 FORECAST_DAYS  = int(os.getenv("FORECAST_DAYS", "16"))

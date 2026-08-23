@@ -109,6 +109,7 @@ tmp/
 # Documentation — internal only, EXCEPT doc/CHANGELOG.md (tracked)
 docs/*
 !docs/CHANGELOG.md
+!docs/decisions.md
 
 # Tests — internal verification scripts, not tracked
 tests/

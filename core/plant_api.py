@@ -65,15 +65,8 @@ plant_store = Chroma(
 
 # ─── Session-level rate limit flag ──────────────────────────────────────────
 # Di-set ke waktu +1 jam saat _get() menyerah karena 429 pada panggilan sekuensial.
-# Fungsi API akan skip request jika waktu sekarang < flag ini.
-# A5: semua akses baca/tulis dibungkus threading.Lock — fetch detail sekarang
-# berjalan paralel (max_workers=3), tanpa lock beberapa worker bisa balapan
-# men-set flag global dan mematikan API untuk semua user selama 1 jam hanya
-# karena satu 429 dari satu worker.
-# A11: block ini sengaja ditaruh SEBELUM startup API-key validation — blok
-# validasi memanggil _trip_rate_limit() di cabang 429; di modul top-level yang
-# dieksekusi sekuensial saat import, pemanggilan sebelum definisi akan memicu
-# NameError yang TIDAK tertangkap oleh `except ImportError` di sugi_core.
+# A5: akses di-lock (paralel detail fetch). A11: blok di atas startup validation.
+# See docs/decisions.md#a5 #a11
 _api_rate_limit_until = 0.0
 _rate_limit_lock = threading.Lock()
 
@@ -85,11 +78,7 @@ def _is_rate_limited() -> bool:
 
 
 def _trip_rate_limit() -> bool:
-    """Aktifkan cooldown 1 jam. Thread-safe (A5: tidak ada race read-modify-write).
-
-    Return True hanya jika flag BARU di-set (dari non-cooldown); False jika
-    sudah dalam cooldown — pemanggil memakai ini untuk mencegah log "dimatikan"
-    berulang saat beberapa thread kena 429 bersamaan.
+    """Aktifkan cooldown 1 jam. Thread-safe (A5). See docs/decisions.md#a5
     """
     global _api_rate_limit_until
     with _rate_limit_lock:
@@ -334,10 +323,9 @@ def fetch_plant_species(plant_name: str) -> list[Document]:
     candidate_ids = [item.get("id") for item in species_list[:5] if item.get("id")]
     documents     = []
 
-    # Fetch detail species secara paralel (bounded pool, max_workers=3).
-    # _ApiQueue.wait() di dalam _get() tetap menjamin rate ke Perenual
-    # (spacing global 1.1s); konkuensi hanya menghilangkan penjumlahan
-    # wall-clock RTT antar request — bukan mencoba melampaui rate limit.
+    # C4: fetch detail paralel (bounded pool, max_workers=3) — _ApiQueue.wait()
+    # tetap menjamin rate ke Perenual; konkuensi hanya menghilangkan RTT serial.
+    # See docs/decisions.md#c4
     with ThreadPoolExecutor(max_workers=3) as pool:
         future_to_id = {
             pool.submit(_fetch_species_detail, pid): pid

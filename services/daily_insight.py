@@ -40,6 +40,11 @@ from datetime import datetime, timezone
 from typing import Any
 import concurrent.futures
 
+if os.path.dirname(os.path.dirname(os.path.abspath(__file__))) not in sys.path:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from services.insight_common import build_insight_llm, ping_with_retry
+
 # ── Env loading ───────────────────────────────────────────────────────────────
 try:
     from dotenv import load_dotenv
@@ -73,7 +78,7 @@ print(f"🔒  OpenSSL version: {ssl.OPENSSL_VERSION}")
 try:
     import certifi
     from pymongo import MongoClient, UpdateOne
-    from pymongo.errors import PyMongoError, ServerSelectionTimeoutError
+    from pymongo.errors import PyMongoError
 except ImportError:
     print("❌  pymongo / certifi belum terinstall.")
     print("    Jalankan: pip install pymongo certifi")
@@ -102,32 +107,10 @@ def _build_mongo_client() -> MongoClient:
     )
 
 
-def _ping_with_retry(mongo: MongoClient, attempts: int = 3, base_wait: float = 5.0) -> None:
-    """A7: ping MongoDB dengan retry + backoff linear (5s, 10s).
-
-    Atlas kadang transient "No primary found" saat pemilihan topologi baru
-    selesai (ServerSelectionTimeoutError). Dulu startup ping sekali tanpa
-    retry dan langsung sys.exit(1), hanya mengandalkan restart proses luar
-    di start_all.py — tambahkan retry di dalam service sendiri (sama seperti
-    farmer_insight_service dan government_insight_service).
-    """
-    for attempt in range(attempts):
-        try:
-            mongo.admin.command("ping")
-            return
-        except ServerSelectionTimeoutError as e:
-            if attempt == attempts - 1:
-                raise
-            wait = base_wait * (attempt + 1)
-            print(f"  DailyInsight: Mongo ping failed (attempt {attempt+1}/{attempts}), "
-                  f"retrying in {wait}s: {e}")
-            time.sleep(wait)
-
-
 try:
     _mongo_client = _build_mongo_client()
     # Test koneksi saat startup
-    _ping_with_retry(_mongo_client)
+    ping_with_retry(_mongo_client, label="DailyInsight")
     print("✅  MongoDB Atlas terhubung.")
 except Exception as e:
     print(f"❌  Gagal koneksi ke MongoDB Atlas: {e}")
@@ -168,16 +151,7 @@ except Exception as e:
 
 # ── Ollama LLM ────────────────────────────────────────────────────────────────
 try:
-    from langchain_ollama.llms import OllamaLLM
-    # A8: timeout 240s — insight generate memanggil LLM berkali-kali dengan
-    # model yang bisa bergantian dimuat di Ollama (bersaing dgn chatbot).
-    _llm = OllamaLLM(
-        model="qwen2.5:1.5b",
-        temperature=0.4,
-        repeat_penalty=1.1,
-        num_ctx=4096,
-        client_kwargs={"timeout": 240},
-    )
+    _llm = build_insight_llm("qwen2.5:1.5b", temperature=0.4)
     print("✅  LLM (qwen2.5:1.5b) siap.")
 except Exception as e:
     _llm = None
@@ -238,14 +212,9 @@ def _ask_llm(prompt: str, fallback: str = "") -> str:
 
 def _run_paced(items: list, worker_fn) -> list:
     """
-    A8-fix: jalankan worker_fn untuk setiap item dengan pacing — TIDAK meledakkan
-    banyak request LLM konkuren ke Ollama sekaligus (Ollama meng-antre, bukan
-    benar-benar memparalelkan; burst konkuren memicu timeout seperti A8 dulu).
-
-    Default DAILY_INSIGHT_MAX_WORKERS=1 → berurutan dengan jeda INSIGHT_LLM_DELAY
-    antar panggilan (pola sama seperti farmer/gov insight service).
-    Jika di-set >1 via env → baru pakai thread pool (keputusan deliberate via env,
-    bukan leftover default).
+    A12: jalankan worker_fn dgn pacing — tidak meledakkan LLM konkuren ke Ollama.
+    Default 1 = berurutan + jeda INSIGHT_LLM_DELAY; >1 = thread pool eksplisit.
+    See docs/decisions.md#a12
     """
     max_workers = DAILY_INSIGHT_MAX_WORKERS
     if max_workers > 1:

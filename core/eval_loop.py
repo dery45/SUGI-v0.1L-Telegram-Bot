@@ -1,13 +1,12 @@
 import re
+import threading
 from typing import Optional
 from langchain_ollama.llms import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # ─── Eval LLM (Qwen2.5-1.5B — lebih kecil dari phi3, lebih baik Indonesia) ─────
-# keep_alive disamakan dgn model lain (C2: residensi). Timeout request dipasang
-# lewat client_kwargs — di langchain-ollama 1.0.1 `timeout=` bukan kwarg OllamaLLM
-# dan akan diserap *args secara diam-diam (C1: defense-in-depth thd hang thread).
+# C2: keep_alive seragam; C1: timeout via client_kwargs. See docs/decisions.md#c1
 _eval_model = OllamaLLM(
     model="qwen2.5:1.5b",
     temperature=0,
@@ -62,10 +61,34 @@ def _parse_rating(raw: str) -> str:
 
 
 # ─── Heuristik lexical (fallback cepat) ──────────────────────────────────────
+# S1: token diseragamkan via stemmer Sastrawi supaya variasi morfologis
+# ("menjawab" vs "dijawab", "penggunaan" vs "digunakan") ikut terhitung overlap.
+# Kalau sastrawi tidak terpasang, fallback ke tokenisasi mentah (degradasi
+# halus, non-fatal) — konsisten dengan pola "fitur opsional" di repositori.
+# Threshold di bawah sudah divalidasi ulang dengan stemming (docs/decisions.md#s1).
+try:
+    from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
+    _stemmer = StemmerFactory().create_stemmer()
+except Exception:
+    _stemmer = None
+
+# S1: eval berjalan di background thread (C1) dan bisa konkuren antar query;
+# Sastrawi memakai cache internal, jadi stem dilindungi lock biar deterministik.
+_stem_lock = threading.Lock()
+
+
+def _stem_tokens(text: str) -> set:
+    """Token unik (min 4 huruf), distem kalau Sastrawi tersedia."""
+    raw = re.findall(r'\b\w{4,}\b', text.lower())
+    if _stemmer is None:
+        return set(raw)
+    with _stem_lock:
+        return {_stemmer.stem(t) for t in raw}
+
 
 def _lexical_faithfulness(answer: str, context: str) -> Optional[str]:
     """
-    Heuristik cepat: cek overlap kata penting antara jawaban dan konteks.
+    Heuristik cepat: cek overlap kata penting (distem) antara jawaban dan konteks.
     Return HIGH/LOW/None (None = tidak konklusif, perlu LLM eval).
     """
     if not context or not answer:
@@ -84,37 +107,34 @@ def _lexical_faithfulness(answer: str, context: str) -> Optional[str]:
         if phrase in answer_lower:
             return "LOW"   # model sendiri bilang tidak ada data → retrieval buruk
 
-    # Cek overlap token antara jawaban dan konteks
-    def tokens(text):
-        return set(re.findall(r'\b\w{4,}\b', text.lower()))
-
-    ans_tokens = tokens(answer)
-    ctx_tokens = tokens(context)
+    # Cek overlap token antar jawaban dan konteks
+    ans_tokens = _stem_tokens(answer)
+    ctx_tokens = _stem_tokens(context)
     if not ans_tokens:
         return None
 
     overlap = len(ans_tokens & ctx_tokens) / len(ans_tokens)
-    if overlap >= 0.40:
+    if overlap >= 0.50:
         return "HIGH"
-    if overlap >= 0.20:
+    if overlap >= 0.25:
         return None   # tidak konklusif → pakai LLM
     return "LOW"
 
 
 def _lexical_relevance(question: str, docs: list) -> Optional[str]:
     """
-    Heuristik cepat untuk relevansi: cek apakah keyword dari pertanyaan
+    Heuristik cepat untuk relevansi: cek apakah keyword (distem) dari pertanyaan
     muncul di dokumen yang diambil.
     """
     if not docs:
         return "LOW"
 
-    q_tokens = set(re.findall(r'\b\w{4,}\b', question.lower()))
+    q_tokens = _stem_tokens(question)
     if not q_tokens:
         return None
 
-    combined = " ".join(d.page_content for d in docs).lower()
-    d_tokens = set(re.findall(r'\b\w{4,}\b', combined))
+    combined = " ".join(d.page_content for d in docs)
+    d_tokens = _stem_tokens(combined)
 
     overlap = len(q_tokens & d_tokens) / len(q_tokens)
     if overlap >= 0.50:

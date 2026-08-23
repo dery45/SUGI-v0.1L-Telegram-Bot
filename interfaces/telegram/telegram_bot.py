@@ -28,6 +28,7 @@ import os
 import json
 import asyncio
 import time
+import httpx
 from pathlib import Path
 
 # ─── Path setup ───────────────────────────────────────────────────────────────
@@ -62,10 +63,14 @@ RATE_LIMIT_SECS    = 3.0    # Minimum detik antar request per user
 # Path file penyimpan offset terakhir yang diproses
 OFFSET_FILE = _ROOT / "data" / "telegram_offset.json"
 
-# User yang diizinkan pakai debug commands (kosong = semua user bisa)
+# R1: FAIL-CLOSED — kosong = SEMUA debug dinonaktifkan. See docs/decisions.md#r1
 DEBUG_ALLOWED_USERS: set[str] = set(
     os.getenv("DEBUG_ALLOWED_USERS", "").split(",")
 ) - {""}
+# R1: peringatan startup sekali. See docs/decisions.md#r1
+if not DEBUG_ALLOWED_USERS:
+    print("⚠️  DEBUG_ALLOWED_USERS kosong — SEMUA perintah debug (!debug/!flags/!session/"
+          "!memory/!stats) dinonaktifkan sampai diisi di .env.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -92,6 +97,26 @@ def save_offset(offset: int) -> None:
         )
     except Exception as e:
         print(f"⚠️  Gagal menyimpan offset file: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R3 — Global error handler: exceptions di luar ask()'s own try/except (mis.
+# _send_long) → fallback reply, bukan keheningan. See docs/decisions.md#r3
+# ─────────────────────────────────────────────────────────────────────────────
+async def _global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"❌  Unhandled error: {context.error}")
+    import traceback
+    traceback.print_exception(
+        type(context.error), context.error, context.error.__traceback__
+    )
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id = update.effective_chat.id,
+                text    = "⚠️ Maaf, terjadi kesalahan tak terduga. Silakan coba lagi.",
+            )
+    except Exception:
+        pass  # best-effort — jangan biarkan error handler itu sendiri crash
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,15 +151,33 @@ class SugiTelegramBot:
         saved_offset = load_offset()
         print(f"📬  Memeriksa pesan offline sejak offset {saved_offset}...")
 
-        try:
-            updates = await app.bot.get_updates(
-                offset          = saved_offset if saved_offset > 0 else None,
-                limit           = 100,
-                timeout         = 10,
-                allowed_updates = ["message"],
-            )
-        except Exception as e:
-            print(f"⚠️  Gagal mengambil update offline: {e}")
+        # get_updates is a long-poll (timeout=10): Telegram often drops the
+        # keep-alive connection mid-read, surfacing as a transient httpx
+        # ReadError/TransportError. Retry with backoff before giving up —
+        # PTB's own run_polling retries internally, so offline catch-up
+        # should behave the same way.
+        updates = []
+        fetch_failed = False
+        for attempt in range(1, 4):
+            try:
+                updates = await app.bot.get_updates(
+                    offset          = saved_offset if saved_offset > 0 else None,
+                    limit           = 100,
+                    timeout         = 10,
+                    allowed_updates = ["message"],
+                )
+                break
+            except httpx.TransportError as e:
+                print(f"⚠️  Gagal mengambil update offline (percobaan {attempt}/3): {e}")
+                fetch_failed = True
+                if attempt < 3:
+                    await asyncio.sleep(2 * attempt)
+            except Exception as e:
+                print(f"⚠️  Gagal mengambil update offline: {e}")
+                return
+
+        if fetch_failed and not updates:
+            print("⚠️  Offline catch-up dilewati (network). Polling akan lanjut normal.")
             return
 
         if not updates:
@@ -158,8 +201,13 @@ class SugiTelegramBot:
         # KUNCI anti-double-send: acknowledge semua update yang sudah diproses ke
         # server Telegram. Tanpa ini, run_polling() akan menerima update yang sama
         # lagi dan handle_message akan mengirim respons kedua kalinya.
+        # Acknowledge adalah best-effort: kalau network drop (httpx.ReadError dll),
+        # polling tetap berjalan dan Telegram server tetap menandai update sebagai
+        # sudah dibaca karena offset disk sudah maju.
         try:
             await app.bot.get_updates(offset=final_offset, limit=1, timeout=3)
+        except httpx.TransportError:
+            pass
         except Exception:
             pass
 
@@ -370,7 +418,8 @@ class SugiTelegramBot:
     # ─────────────────────────────────────────────────────────────────────────
     async def cmd_debug(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
-        if DEBUG_ALLOWED_USERS and user_id not in DEBUG_ALLOWED_USERS:
+        # R1: deny by default. See docs/decisions.md#r1
+        if user_id not in DEBUG_ALLOWED_USERS:
             await update.message.reply_text("⛔ Akses debug tidak diizinkan.")
             return
         await update.message.reply_text(
@@ -437,7 +486,8 @@ class SugiTelegramBot:
 
         # ── Debug commands via chat ───────────────────────────────────────────
         if question.startswith("!"):
-            if DEBUG_ALLOWED_USERS and user_id not in DEBUG_ALLOWED_USERS:
+            # R1: deny by default. See docs/decisions.md#r1
+            if user_id not in DEBUG_ALLOWED_USERS:
                 await update.message.reply_text("⛔ Akses debug tidak diizinkan.")
                 return
 
@@ -470,8 +520,7 @@ class SugiTelegramBot:
             self._keep_typing(update.effective_chat.id, context.bot, stop_typing)
         )
 
-        # D1: bandingkan waktu ask() di dalam SugiCore vs waktu wrapper
-        # Telegram — untuk membedakan bottleneck generasi vs pengiriman.
+        # D1: bandingkan ask() internal vs wrapper. See docs/decisions.md#d1
         _tg_start = time.monotonic()
         try:
             response = await asyncio.to_thread(
@@ -539,6 +588,9 @@ class SugiTelegramBot:
             await self._process_offline_backlog(application)
 
         app.post_init = post_init
+
+        # R3: daftarkan error handler SEBELUM polling. See docs/decisions.md#r3
+        app.add_error_handler(_global_error_handler)
 
         print(f"🚀  Sugi Telegram Bot berjalan... (token: {TELEGRAM_TOKEN[:10]}...)")
         app.run_polling(

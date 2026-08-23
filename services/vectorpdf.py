@@ -18,8 +18,9 @@ load_dotenv(_ROOT / "config" / ".env")
 
 DATASET_DIR = str(_ROOT / "data" / "raw_pdfs")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "mxbai-embed-large")
-# M0: tunda initial scan agar chatbot (yang juga pakai Ollama) warm-up dulu.
+# M0: tunda initial scan agar chatbot warm-up dulu. See docs/decisions.md#m0
 STARTUP_GRACE_SECONDS = int(os.getenv("STARTUP_GRACE_SECONDS", "180"))
+BM25_CACHE_PATH = os.getenv("BM25_CACHE_PATH", str(_ROOT / "data" / "db" / "bm25_cache.pkl"))
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────
 import chromadb as _chromadb
@@ -85,8 +86,39 @@ def _get_splitter(file_name: str) -> tuple:
     return splitter, label
 
 
+# N1: naikkan versi ini setiap logika ekstraksi/metadata berubah — semua hash
+# konten berubah sekali, memicu SATU reindex terkendali via mekanisme R4.
+# See docs/decisions.md#n1
+_METADATA_SCHEMA_VERSION = "v2"
+
+
 def normalize(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
+
+def _file_content_hash(path: str) -> str:
+    """R4 + N1 — MD5 isi file + _METADATA_SCHEMA_VERSION (per 8KB chunk)."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    h.update(_METADATA_SCHEMA_VERSION.encode())
+    return h.hexdigest()
+
+
+def _stored_hash(existing: dict) -> str | None:
+    """R4 — ambil file_hash dari hasil Chroma get() (kosong → None)."""
+    metadatas = existing.get("metadatas") or []
+    if metadatas and "file_hash" in metadatas[0]:
+        return metadatas[0]["file_hash"]
+    return None
+
+
+def invalidate_bm25_cache():
+    """R4 — PDF baru/diubah = korpus BM25 berubah; cache harus invalid."""
+    if os.path.exists(BM25_CACHE_PATH):
+        os.remove(BM25_CACHE_PATH)
+        print("🗑️  BM25 cache invalidated — will rebuild on next main.py start.")
 
 
 def index_file(file_path: str):
@@ -95,10 +127,15 @@ def index_file(file_path: str):
     if not file_name.lower().endswith(".pdf"):
         return
 
-    existing = vector_store.get(where={"source": file_name}, limit=1)
+    # R4: dedup by CONTENT HASH — PDF di-edit tetap ter-reindex. See docs/decisions.md#r4
+    file_hash = _file_content_hash(file_path)
+    existing  = vector_store.get(where={"source": file_name}, limit=1)
     if existing["ids"]:
-        print(f"⏭️  Already indexed: {file_name}")
-        return
+        if _stored_hash(existing) == file_hash:
+            print(f"⏭️  Unchanged (already indexed): {file_name}")
+            return
+        print(f"♻️  Content changed: {file_name} — replacing old chunks...")
+        vector_store.delete(where={"source": file_name})
 
     print(f"📄 New PDF: {file_name}")
     try:
@@ -113,6 +150,7 @@ def index_file(file_path: str):
         for chunk in chunks:
             chunk.metadata["source"]   = file_name
             chunk.metadata["pdf_type"] = pdf_type
+            chunk.metadata["file_hash"] = file_hash
             content      = normalize(chunk.page_content)
             combined_str = (
                 f"{content}_{file_name}"
@@ -134,11 +172,12 @@ def index_file(file_path: str):
                     ids=ids[i:i+batch_size]
                 )
             print(f"✅ Indexed: {file_name}")
+            # R4: semua path indexing (baru/changed) invalidate BM25. See docs/decisions.md#r4
+            invalidate_bm25_cache()
 
     except Exception as e:
         err_str = str(e).lower()
-        # A2: PDF terenkripsi (AES / butuh password) bukan error generik —
-        # log khusus supaya tidak terbaca sebagai kegagalan sistem.
+        # A2: PDF terenkripsi (AES/password) bukan error generik. See docs/decisions.md#a2
         if "aes" in err_str or "encrypted" in err_str or "cryptography" in err_str:
             print(f"🔒 Skipped (encrypted, needs password): {file_name}")
         else:

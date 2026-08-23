@@ -25,7 +25,7 @@ load_dotenv(_ROOT / "config" / ".env")
 DATASET_DIR     = str(_ROOT / "data" / "raw_dataset")
 EMBED_MODEL     = os.getenv("EMBED_MODEL", "mxbai-embed-large")
 BM25_CACHE_PATH = os.getenv("BM25_CACHE_PATH", str(_ROOT / "data" / "db" / "bm25_cache.pkl"))
-# M0: tunda initial scan agar chatbot (yang juga pakai Ollama) warm-up dulu.
+# M0: tunda initial scan agar chatbot warm-up dulu. See docs/decisions.md#m0
 STARTUP_GRACE_SECONDS = int(os.getenv("STARTUP_GRACE_SECONDS", "180"))
 
 # ─── ChromaDB server connection ──────────────────────────────────────────────
@@ -91,8 +91,44 @@ vector_store = Chroma(
 )
 
 
+# N1: naikkan versi ini setiap logika ekstraksi/metadata berubah — semua hash
+# konten berubah sekali, memicu SATU reindex terkendali via mekanisme R4.
+# See docs/decisions.md#n1
+_METADATA_SCHEMA_VERSION = "v2"
+
+# N1: kandidat nama kolom provinsi — sama seperti farmer_insight_service._province_field().
+# See docs/decisions.md#n1
+_PROVINCE_COL_CANDIDATES = ("provinsi", "province", "nama_provinsi", "wilayah", "region")
+
+
 def normalize(text: str) -> str:
     return " ".join(text.lower().strip().split())
+
+
+def _file_content_hash(path: str) -> str:
+    """R4 + N1 — MD5 isi file + _METADATA_SCHEMA_VERSION (per 8KB chunk)."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            h.update(chunk)
+    h.update(_METADATA_SCHEMA_VERSION.encode())
+    return h.hexdigest()
+
+
+def _df_content_hash(df: pd.DataFrame) -> str:
+    """R4 + N1 — MD5 representasi CSV df + _METADATA_SCHEMA_VERSION (XLSX per-sheet)."""
+    csv_bytes = df.to_csv(index=False).encode("utf-8", errors="ignore")
+    h = hashlib.md5(csv_bytes)
+    h.update(_METADATA_SCHEMA_VERSION.encode())
+    return h.hexdigest()
+
+
+def _stored_hash(existing: dict) -> str | None:
+    """R4 — ambil file_hash dari hasil Chroma get() (kosong → None)."""
+    metadatas = existing.get("metadatas") or []
+    if metadatas and "file_hash" in metadatas[0]:
+        return metadatas[0]["file_hash"]
+    return None
 
 
 def read_csv_safe(file_path):
@@ -121,7 +157,8 @@ def read_xlsx_safe(file_path):
         return None
 
 
-def process_dataframe(df, file_name, sheet_name=None, forced_type=None):
+def process_dataframe(df, file_name, sheet_name=None, forced_type=None,
+                      file_content_hash=None):
     """
     Proses satu DataFrame menjadi list (Document, doc_id).
 
@@ -158,11 +195,21 @@ def process_dataframe(df, file_name, sheet_name=None, forced_type=None):
             content_parts.append(f"{k}: {v}")
         full_content = "\n".join(content_parts)
 
+        # N1: hoist kolom provinsi ke metadata agar daily_insight bisa grouping
+        # per provinsi (cabang price_insights). See docs/decisions.md#n1
+        province_val = None
+        for col_name, col_value in row_dict.items():
+            if col_name.lower().strip() in _PROVINCE_COL_CANDIDATES and col_value:
+                province_val = str(col_value)
+                break
+
         base_metadata = {
             "source":        file_name,
             "row_id":        str(i),
             "data_type":     data_type,         # ← baru: untuk filtering
+            **({"file_hash": file_content_hash} if file_content_hash else {}),
             **({"sheet": sheet_name} if sheet_name else {}),
+            **({"province": province_val} if province_val else {}),
         }
 
         chunks = text_splitter.split_text(full_content)
@@ -194,14 +241,21 @@ def index_file(file_path: str):
     indexed   = False
 
     if ext == ".csv":
-        existing = vector_store.get(where={"source": file_name}, limit=1)
+        # R4: dedup by CONTENT HASH — edit file sama tetap re-index. See docs/decisions.md#r4
+        file_hash = _file_content_hash(file_path)
+        existing  = vector_store.get(where={"source": file_name}, limit=1)
         if existing["ids"]:
-            print(f"⏭️  Already indexed: {file_name}")
-            return
+            if _stored_hash(existing) == file_hash:
+                print(f"⏭️  Unchanged (already indexed): {file_name}")
+                return
+            print(f"♻️  Content changed: {file_name} — replacing old chunks...")
+            vector_store.delete(where={"source": file_name})
         df = read_csv_safe(file_path)
         if df is not None:
             print(f"📄 Indexing CSV: {file_name} ({len(df)} rows)")
-            for doc, doc_id in process_dataframe(df, file_name):
+            for doc, doc_id in process_dataframe(
+                df, file_name, file_content_hash=file_hash
+            ):
                 documents.append(doc)
                 ids.append(doc_id)
 
@@ -210,13 +264,22 @@ def index_file(file_path: str):
         if sheets is None:
             return
         for sheet_name, df in sheets.items():
+            # R4: dedup per-sheet by content hash. See docs/decisions.md#r4
+            sheet_hash = _df_content_hash(df)
             existing = vector_store.get(
                 where={"$and": [{"source": file_name}, {"sheet": sheet_name}]}, limit=1
             )
             if existing["ids"]:
-                continue
+                if _stored_hash(existing) == sheet_hash:
+                    continue
+                print(f"♻️  Content changed: {file_name} → {sheet_name} — replacing...")
+                vector_store.delete(
+                    where={"$and": [{"source": file_name}, {"sheet": sheet_name}]}
+                )
             print(f"📄 New sheet: {file_name} → {sheet_name} ({len(df)} rows)")
-            for doc, doc_id in process_dataframe(df, file_name, sheet_name=sheet_name):
+            for doc, doc_id in process_dataframe(
+                df, file_name, sheet_name=sheet_name, file_content_hash=sheet_hash
+            ):
                 documents.append(doc)
                 ids.append(doc_id)
     else:

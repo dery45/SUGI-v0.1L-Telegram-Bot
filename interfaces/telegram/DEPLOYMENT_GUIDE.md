@@ -66,7 +66,7 @@ SUGI uses a `.env` file in `config/` for all configurations. Use `config/.env.ex
 | `LLM_MODEL` | Main response model | `sugi-v0.1L` |
 | `UTILITY_MODEL` | Utility tasks (rewriting, extraction) | `qwen2.5:1.5b` |
 | `CHROMA_HOST` / `CHROMA_PORT` | ChromaDB server connection | `localhost:8000` |
-| `DEBUG_ALLOWED_USERS` | Restrict `!debug` commands (comma-separated IDs) | *(All)* |
+| `DEBUG_ALLOWED_USERS` | Restrict `/debug` + `!`-commands to these Telegram user IDs (comma-separated) | *(empty — all debug disabled, R1 fail-closed)* |
 | `MEMORY_TTL_DAYS` | Days to keep session summaries | `14` |
 | `SCOPE_CONFIG_PATH` | Allowed agricultural topics config | `config/settings/scope_config.ini` |
 | `REWRITER_CONFIG_PATH` | Query rewriting rules config | `config/settings/rewriter_config.ini` |
@@ -175,7 +175,7 @@ WantedBy=multi-user.target
 
 ## Important Security Notes
 
-1. **Debugging Safety**: Always set `DEBUG_ALLOWED_USERS` in production to prevent unauthorized access to query logs and session metadata.
+1. **Debugging Safety**: `DEBUG_ALLOWED_USERS` is **fail-closed (R1)** — if empty, all `/debug` and `!`-commands are disabled for every user (a startup warning is printed). Set it to the exact comma-separated Telegram user IDs that should access query logs/session metadata; leaving it empty is the safe default.
 2. **Context Window**: The system uses `num_ctx=4096` to prevent overflow errors. Ensure your local Ollama model supports this size.
 3. **Embedding Limit**: Documents over 2,000 characters are automatically truncated during storage to fit within the `mxbai-embed-large` 512-token limit. Failed embeddings are caught gracefully without crashing the system.
 4. **Scope Guard**: The system uses definitional phrase detection and rewrite-type gating to prevent out-of-scope queries from being incorrectly answered. Only suffix-based rewrites can bypass the initial scope check.
