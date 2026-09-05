@@ -148,15 +148,17 @@ class GovernmentInsightEngine:
         print(f"  GovInsight: Initializing (model={MODEL_NAME})...")
 
         # — MongoDB —
+        # Hormati tls=false di URI (self-hosted tanpa TLS seperti
+        # sugiecosystem.cloud) — jangan paksa tls=True kalau URI minta false.
+        _use_tls = "tls=false" not in MONGO_URI.lower() and "ssl=false" not in MONGO_URI.lower()
+        _tls_kwargs = dict(tls=True, tlsCAFile=certifi.where(), tlsAllowInvalidCertificates=False) if _use_tls else {}
         self._mongo = MongoClient(
             MONGO_URI,
             serverSelectionTimeoutMS=15_000,
             socketTimeoutMS=30_000,
             connectTimeoutMS=20_000,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            tlsAllowInvalidCertificates=False,
             retryWrites=True,
+            **_tls_kwargs,
         )
         ping_with_retry(self._mongo, label="GovInsight")
         print("  GovInsight: MongoDB connected.")
@@ -165,10 +167,15 @@ class GovernmentInsightEngine:
         self._target_db = self._mongo["sugi_insights"]
         self._target_test_db = self._mongo["test"]
 
-        self._target_db["governmentinsights"].create_index(
-            "sourceCollection", unique=True, background=True
-        )
-        print("  GovInsight: Index ensured on governmentinsights.sourceCollection.")
+        try:
+            self._target_db["governmentinsights"].create_index(
+                "sourceCollection", unique=True, background=True
+            )
+            print("  GovInsight: Index ensured on governmentinsights.sourceCollection.")
+        except Exception as e:
+            # Best-effort: don't crash if user lacks dbAdmin on sugi_insights (code 13 Unauthorized)
+            print(f"  GovInsight: skip index sugi_insights.governmentinsights: {e.__class__.__name__}: {e}")
+            print("  GovInsight: continuing without index (ensure sugi_user has dbAdmin on sugi_insights if you want indexes).")
 
         # — LLM —
         self._llm = build_insight_llm(MODEL_NAME, temperature=0.3)

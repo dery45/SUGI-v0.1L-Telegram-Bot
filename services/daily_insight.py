@@ -87,24 +87,39 @@ except ImportError:
 
 def _build_mongo_client() -> MongoClient:
     """
-    Buat MongoClient dengan konfigurasi TLS yang benar untuk MongoDB Atlas.
+    Buat MongoClient dengan konfigurasi TLS yang benar.
 
-    - tlsCAFile=certifi.where()      → pakai CA bundle dari certifi (up-to-date)
-    - tlsAllowInvalidCertificates=False → validasi sertifikat dengan benar (JANGAN True)
-    - tls=True                       → aktifkan TLS secara eksplisit
-    - retryWrites=True               → retry otomatis pada transient error
+    - Jika URI mengandung tls=false/ssl=false → jangan pakai TLS (untuk self-hosted
+      tanpa TLS seperti sugiecosystem.cloud). Ini yang menyebabkan SSL handshake
+      error sebelumnya: kode memaksa tls=True padahal URI minta tls=false.
+    - Jika TLS aktif (Atlas) → pakai certifi CA bundle + validasi ketat.
     """
-    return MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=15_000,
-        socketTimeoutMS=20_000,
-        connectTimeoutMS=20_000,
-        tls=True,
-        tlsCAFile=certifi.where(),
-        tlsAllowInvalidCertificates=False,   # ← WAJIB False agar handshake benar
-        retryWrites=True,
-        retryReads=True,
-    )
+    # Hormati tls=false di URI — jangan override dengan tls=True
+    uri_lower = MONGO_URI.lower()
+    use_tls = "tls=false" not in uri_lower and "ssl=false" not in uri_lower
+
+    if use_tls:
+        return MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15_000,
+            socketTimeoutMS=20_000,
+            connectTimeoutMS=20_000,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=False,
+            retryWrites=True,
+            retryReads=True,
+        )
+    else:
+        # Self-hosted tanpa TLS — jangan kirim opsi TLS sama sekali
+        return MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15_000,
+            socketTimeoutMS=20_000,
+            connectTimeoutMS=20_000,
+            retryWrites=True,
+            retryReads=True,
+        )
 
 
 try:
