@@ -23,6 +23,7 @@ import configparser as _cp
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 
@@ -271,6 +272,9 @@ _ANSWER_TEMPLATE_BASE = (
 )
 
 
+# P2-3: prompt versioning — bump when _ANSWER_TEMPLATE_BASE changes materially
+PROMPT_VERSION = "v1"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUGI CORE CLASS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -295,13 +299,14 @@ class SugiCore:
             repeat_penalty = 1.15,
             keep_alive     = 600,   # residensi 10 menit (C2) — see docs/decisions.md#c2
             num_ctx        = 4096,  # stability guard (C3)
-            num_predict    = 512,   # batas token output (C3)
+            num_predict    = 400,   # P3-1: tightened from 512 (rarely near ceiling) to bound worst-case
         )
         self.rewrite_model = OllamaLLM(
             model          = UTILITY_MODEL,
             temperature    = 0,
             keep_alive     = 600,   # seragam dgn self.model (C2)
             num_predict    = 40,    # bounded worst-case cost (B1)
+            base_url       = os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11434"),  # H2a: isolate utility from primary
             client_kwargs  = {"timeout": 30},  # D2: timeout via httpx client
         )
 
@@ -399,6 +404,7 @@ class SugiCore:
             temperature    = 0,
             keep_alive     = 600,                    # residensi seragam (C2)
             num_predict    = 10,                     # cap ketat 1-3 kata nama tanaman
+            base_url       = os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11434"),  # H2a: isolate utility from primary
             client_kwargs  = {"timeout": 30},        # D2: timeout via httpx client
         )
         self._plant_fallback_chain = (
@@ -429,15 +435,26 @@ class SugiCore:
     # PUBLIC API
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def ask(self, user_id: str, question: str, platform: str = "cli") -> str:
+    def ask(self, user_id: str, question: str, platform: str = "cli",
+            on_chunk: Optional[Callable[[str], None]] = None) -> str:
         """
         Proses pertanyaan dari user dan kembalikan jawaban sebagai string.
         Dipakai oleh CLI (main.py) dan Telegram (telegram_bot.py).
+        P2-4: on_chunk(accumulated_text) called per stream chunk for Telegram streaming;
+              additive and backward-compatible (CLI doesn't pass it).
         """
         # T1: normalize whitespace upfront so all downstream exact-substring
         # phrase matchers (_TIME_PHRASES, WEATHER_KEYWORDS, etc.) are robust
         # against double spaces, tabs, newlines from mobile keyboards.
         question = re.sub(r"\s+", " ", question).strip()
+        # T1-2: Input Length Guard — bound worst-case compute before any
+        # embedding/retrieval/LLM work. Env-tunable, fails fast.
+        _max_chars = int(os.getenv("MAX_QUESTION_CHARS", "2000"))
+        if len(question) > _max_chars:
+            return (
+                f"Maaf, pertanyaan terlalu panjang (maksimal {_max_chars} karakter). "
+                f"Coba persingkat pertanyaan Anda."
+            )
 
         session           = self._get_or_create_session(user_id)
         trace             = new_query_trace(session["session_id"])
@@ -445,6 +462,10 @@ class SugiCore:
         is_greeting_q     = self._is_greeting(question)
 
         _local_start = time.monotonic()  # D1: ukur ask() mandiri. See docs/decisions.md#d1
+        # I1: stage breakdown — lightweight per-stage timing
+        _t = {}
+        _mark = lambda name: _t.__setitem__(name, time.monotonic())
+        _mark("start")
 
         full_response = ""
         error_msg     = None
@@ -453,6 +474,7 @@ class SugiCore:
             # ── [1] Scope check ───────────────────────────────────────────────
             print("🛡️  Checking scope...")
             in_scope = self._is_in_scope(question)
+            _mark("scope_done")
             
             history_text = self._format_history(session["history"])
             has_history  = len(session["history"]) > 0
@@ -468,6 +490,7 @@ class SugiCore:
                 if rewrite_type == "suffix":
                     print("   [scope] original failed — checking rewritten (suffix-only)...")
                     in_scope = self._is_in_scope(standalone_query)
+            _mark("rewrite_done")
             
             trace["scope_passed"] = in_scope
             trace["rewritten"]    = standalone_query
@@ -519,6 +542,7 @@ class SugiCore:
 
             if include_weather:
                 print("🌤️  Weather query detected.")
+            _mark("plant_done")
 
             # ── Retrieval ─────────────────────────────────────────────────────
             print("🗂️  Retrieving and reranking documents...")
@@ -561,6 +585,7 @@ class SugiCore:
                         mem_docs = mem_future.result()
                     except Exception as _mem_err:
                         print(f"   ⚠️  Memory recall error: {_mem_err}")
+            _mark("retrieval_done")
 
             # A11/M1: ensemble TANPA compression wrapper → rerank TEPAT SATU KALI di sini.
             # See docs/decisions.md#a11
@@ -573,6 +598,7 @@ class SugiCore:
             print(f"🎯  Re-ranked {len(combined_candidates)} candidates → "
                   f"{len(reranked)} "
                   f"({time.monotonic() - _t_rerank:.2f}s)")
+            _mark("rerank_done")
             ordered_candidates = reranked
 
             # Dedup by content hash
@@ -616,9 +642,30 @@ class SugiCore:
                 "history":  prompt_history,
             }):
                 full_response += chunk
+                if on_chunk:
+                    try:
+                        on_chunk(full_response)
+                    except Exception:
+                        pass
 
+            _mark("generation_done")
             # T2 backup: strip forbidden data-narration openers
             full_response = self._strip_data_narration(full_response)
+
+            # I1: stage breakdown print
+            try:
+                stages = {
+                    "scope":      _t["scope_done"] - _t["start"],
+                    "rewrite":    _t["rewrite_done"] - _t["scope_done"],
+                    "plant":      _t["plant_done"] - _t["rewrite_done"],
+                    "retrieval":  _t["retrieval_done"] - _t["plant_done"],
+                    "rerank":     _t["rerank_done"] - _t["retrieval_done"],
+                    "generation": _t["generation_done"] - _t["rerank_done"],
+                }
+                total = _t["generation_done"] - _t["start"]
+                print(f"[STAGE_TIMING] {stages} total={total:.2f}s")
+            except Exception:
+                pass
 
             print(full_response)
             trace["answer_preview"] = full_response[:200]

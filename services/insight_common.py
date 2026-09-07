@@ -22,14 +22,20 @@ def ping_with_retry(mongo: MongoClient, label: str, attempts: int = 3, base_wait
 
 def build_insight_llm(model_name: str, temperature: float, timeout: int = 240):
     """A8: OllamaLLM konsisten (timeout 240s dipakai semua service insight).
-    See docs/decisions.md#a8
+    P2-2: reads OLLAMA_HOST_INSIGHT to isolate background generation from user path.
+    G2: keep_alive shortened to 60s for insight instance to free VRAM/RAM between
+        infrequent cycles (3600s-86400s), trades cold reload for headroom.
+    See docs/decisions.md#a8, #p2-2, #g2
     """
+    import os
     from langchain_ollama.llms import OllamaLLM
     return OllamaLLM(
         model=model_name,
         temperature=temperature,
         repeat_penalty=1.1,
         num_ctx=4096,
+        keep_alive=60,  # G2: 60s vs default 5m, unloads between insight cycles
+        base_url=os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11434"),
         client_kwargs={"timeout": timeout},
     )
 

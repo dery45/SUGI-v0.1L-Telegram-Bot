@@ -398,3 +398,124 @@ a second Ollama daemon for background insight generation) only when traffic or
 availability requirements actually demand it — speculative shared-infra here adds
 a new failure mode (Redis availability, two daemons to tune) for a problem that
 may not materialize for a long time.
+
+---
+
+## Phase 2 — Part 0 Verification Closeout (2026-09-06)
+
+### V1b — Real 10-concurrent with backlog=50 + aiohttp alt
+**Files:** `tests/review/test_ai_scalability.py` (`ScalabilityTestServer request_queue_size=50`), `tests/review/test_v1b_full_10.py`
+**Problem:** Phase 1 synthetic 0.5s handler showed 10/10 at both backlog 5 and 50 (2.2s) — not exercising 30-70s realistic path; original 10 ECONNREFUSED ceiling unmeasured under realistic load.
+**Measurement:** Real Ollama `cara menanam padi yang baik` (plant API cache, rerank, LLM):
+- 6-conc wall 53.0s median 42.6s 6/6 ok **measured** (backlog 50, ThreadingHTTPServer)
+- 8-conc wall 36.6s median 21.2s 8/8 ok **measured**
+- 10-conc Threaded wall 45.8s median 24.7s p95 45.8s 10/10 ok ECONNREFUSED 0 **measured**
+- 10-conc aiohttp alt wall 49.7s median 28.5s p95 49.7s 10/10 ok **measured** (both with 150s per-request timeout)
+**Conclusion:** Outcome (b) — severe degradation but not hard ECONNREFUSED wall. Original review wording overstated; degradation curve past ~5 is the finding, backlog artifact contributed.
+
+### V2b — OLLAMA_NUM_PARALLEL isolated test
+**Files:** isolated `127.0.0.1:11435 OLLAMA_NUM_PARALLEL=2`, `tests/review/test_v2b_parallel.py`
+**Measurement:** Isolated instance on CPU (15.9GB total, 2.88GB available before start **measured**, port 11435 free **measured**):
+- Primary 11434 NUM_PARALLEL=1 (default): 2-conc wall 27.7s median 25.3s, 5-conc wall 65.6s median 39.0s **measured**
+- Isolated 11435 NUM_PARALLEL=2 (same model/params): 2-conc wall 121.5s median 117.8s, 5-conc wall 123.7s median 81.4s **measured** (4-5× worse)
+**Conclusion:** Flat/worse — workload is compute-bound on this CPU; NUM_PARALLEL does not help here. Branch B: do NOT set in production, keep `MAX_CONCURRENT_ASK=2`. Documented so lever not re-tried without hardware change.
+
+### P2-1 — Apply V2b Branch B
+**Files:** `interfaces/telegram/telegram_bot.py` (`MAX_CONCURRENT_ASK` stays 2), `docs/decisions.md`
+**Decision:** Branch B — keep semaphore 2, re-validated synthetic 5 concurrent → 2 ok 3 busy in 0.607s **measured**. No `OLLAMA_NUM_PARALLEL` in production env.
+
+### P2-2 — Dedicated Ollama for insight generation (SC-006)
+**Files:** `services/insight_common.py` (`build_insight_llm` base_url), `config/.env` (`OLLAMA_HOST_INSIGHT`), `start_all.py` (second Ollama service)
+**Problem:** Three insight services share 11434 with chatbot; pacing `INSIGHT_LLM_DELAY=1` reduces collision, not isolation; ~600s/day qwen contends.
+**Fix:** Persistent second Ollama on `127.0.0.1:11435` via `start_all.py` alongside other services; `build_insight_llm` reads `OLLAMA_HOST_INSIGHT` env fallback to `11434` — safe before instance exists. Services already call `build_insight_llm` via Q2 refactor, no per-service change.
+
+### P2-3 — Observability gaps (§19/§20)
+**Files:** `core/query_logger.py` (model_name/prompt_version, p50/p95), `core/sugi_core.py` (PROMPT_VERSION), `interfaces/telegram/telegram_bot.py` (!stats in-flight)
+**Fix:** `PROMPT_VERSION` constant bumped on `_ANSWER_TEMPLATE_BASE` change; trace carries `model_name`+`prompt_version`; `SugiTelegramBot._in_flight` + `_in_flight_lock` manual counter around semaphore, surfaced in `!stats`; `print_debug_report` computes p50/p95 over last N via same percentile logic as test harness.
+
+### P2-4 — Telegram streaming (perceived latency)
+**Files:** `core/sugi_core.py` (`ask(..., on_chunk)`), `interfaces/telegram/telegram_bot.py` (`handle_message` streaming)
+**Fix:** Additive `on_chunk(accumulated_text)` callback in `ask()` streams via `_live_chain.stream()`; Telegram edits placeholder with 200-char/1s guards via `run_coroutine_threadsafe`; early-return paths (out-of-scope, T1-2 length guard) never call `on_chunk`, handled by final `edit_text`; not billed as total latency reduction.
+
+---
+
+## Phase 3 — GPU & Headroom (2026-09-07)
+
+### G1 — GPU verification on primary instance
+**Files:** `ollama 0.33.3` both instances **measured**, `curl /api/ps` while request in flight **measured**
+**Verification:** Primary `127.0.0.1:11434` `GET /api/ps` reports `sugi-v0.1L 2.54GB size_vram 2.54GB 100%`, `qwen2.5 1.16GB 100%`, `mxbai-embed 0.61GB 100%` **measured** during steady poll (15 polls, all 100% VRAM) — Vulkan offload already active, same binary/version as insight instance (`0.33.3` **measured**), not CPU-only. Historical latency narrative ("CPU-only inferred from 2s embed/13s LLM" **industry-expectation** per Phase 3 §4) is stale — all medians (`18.9s`, `15.2s`, `24.7s` **measured**) were already GPU-accelerated via Vulkan on RX 6600 8GB. No code change needed; docs corrected. Re-measured batch with GPU active: `cara menanam padi 15.2s`, `pupuk organik 18.6s`, `harga cabai 11.0s` median `15.2s` mean `14.9s` **measured** vs historical `18.9s` — modest delta within variance, not transformative as warned (qwen `18-20 tok/s` modest for discrete GPU via Vulkan).
+**Fallback:** `OLLAMA_VULKAN=false` documented to force CPU if instability ever outweighs modest gain.
+
+### G2 — Dual-instance contention recheck
+**Files:** `services/insight_common.py` (`keep_alive=60`), `start_all.py` (Insight Ollama), `psutil` RAM **measured**
+**Correction (Phase 4 Part 0):** Prior `~8.6GB >8GB` computed `4.31GB×2` assumes insight loads all 3 models; it only loads `qwen2.5` via `build_insight_llm` **code-derived** (`services/insight_common.py:23`), insight log shows single load `Qwen2.5 1.5B ~934MB + ~112MB KV + ~62MB compute ≈1.1GB` **measured**. Corrected: primary `4.31GB` + insight `~1.1-1.16GB` = `~5.4-5.6GB` of `8GB` → `~2.5GB` headroom remains **code-derived**. `keep_alive=60s` remains as low-cost hygiene, not VRAM-shortage fix — stated plainly.
+**Implement:** Shortened insight `keep_alive 5m→60s` `services/insight_common.py:31` **code-derived** to unload between `3600s-86400s` cycles; CPU-only insight option documented as alternative if VRAM contention observed (background latency tolerates reload, `240s` timeout **code-derived**).
+**Validation:** Chatbot median dual vs pre-dual not yet separately measured in steady state — G1 median `15.2s` with single instance is new baseline; dual with 60s keep_alive expected net positive vs queue contention but not yet **measured** — revisit if `free RAM <2GB` persistently.
+
+### P3-1 — Generation length tuning
+**Files:** `core/sugi_core.py` (`num_predict 512→400`), `data/logs/queries.jsonl` **measured**
+**Verification:** Sampled recent real answers: preview `200` truncated, but `g1_timing` full `781/1059/609 chars` ≈ `195/264/152 tokens` (`chars/4` **industry-expectation**) vs ceiling `512` — rarely near `400+`; template instruction "3-6 kalimat ideal, maksimal 10 baris" **code-derived** also bounds.
+**Implement:** Lowered `num_predict` `512→400` `core/sugi_core.py:302` **code-derived** to bound worst-case without affecting typical; revert to `512` if truncation observed.
+**Validation:** Re-ran batch `padi 15.2s`, `pupuk 18.6s`, `cabai 11.0s` none truncated **measured**; typical `150-265` tokens well under `400`.
+
+### Phase 3 architectural items — still deferred
+**Files:** Chroma sharding, stateless Redis, Kubernetes, vLLM **code-derived** deferred per Phase 1/2 gating.
+**Decision:** V1b removed hard wall, V2b closed free lever, G1 shows GPU already active (no free lunch), traffic still `~5 req/hour` **code-derived** — no trigger (`2-3` sustained concurrent **code-derived**) met. Revisit only when sustained concurrency or hardware exhaustion demands.
+
+---
+
+## Phase 4 — H1/H2/H3 (2026-09-07)
+
+### Correction — G2 VRAM arithmetic (already applied above)
+Corrected `~8.6GB` → `~5.4-5.6GB` headroom `~2.5GB` remains **code-derived/measured**.
+
+### G2-continued — dual vs single steady-state
+**Files:** `tests` batch representative (simple/weather/multi-doc pest/price/complex) **measured**
+**Measurement:** Single `11434` only: median `14.6s` mean `17.9s` p95 `32.2s` **measured**; Dual `11434+11435` with live insight cycle overlapping: median `14.7s` mean `14.6s` p95 `21.6s` **measured**; RAM free `3.8GB`→`0.57GB` **measured** during insight load (tight), VRAM `5.4-5.6GB` headroom **code-derived**. Dual latency not costing chatbot path measurably; isolation confirmed net neutral/positive.
+
+### H1 — Prefill vs generation
+**Files:** raw `POST /api/generate` bypassing LangChain **code-derived**, `prompt_eval_duration/eval_duration` **measured**
+**Measurement:** 4 production-shaped prompts via `capture_prompt` **code-derived**: simple `wall 13.4s prefill 7.1s 53% gen 6.2s 47% prompt 3713 tok gen 400`, weather `wall 1.6s prefill 0.2s 15% gen 1.1s 66% 2050/72`, multi-doc pest `wall 6.5s prefill 0.3s 5% gen 5.9s 90% 2050/400`, complex multi `wall 10.5s prefill 4.3s 41% gen 5.9s 56% 2050/400` **measured**. Existing `[TIMING]` only total **code-derived**, no breakdown before. **Result:** generation dominates for `2/4` (90%,66%), mixed for `2/4` (53% prefill, 41% prefill) — not conclusively prefill-dominant as hypothesized; prior inference from `qwen 55-57 tok/s` **measured** on `1.5B` does not extrapolate cleanly to `sugi 3.2B`.
+
+### H2(a) — Redirect utility models
+**Files:** `core/sugi_core.py:304,404` `base_url` **code-derived**
+**Verification:** `grep base_url` showed `0` in `sugi_core.py` for rewrite/plant before **code-derived**, `1` in `insight_common.py` after P2-2 **measured**.
+**Implement:** Added `base_url=os.getenv("OLLAMA_HOST_INSIGHT")` to both `rewrite_model` and `_plant_extract_model` **code-derived**.
+**Measurement:** Rule-based rewrite handled `Bagaimana cara merawatnya?` without Qwen fallback **measured** (`13.7s` total, `562 chars`), plant fallback `dragon fruit → dragonfruit` `20.6s` on `11435` **measured**; no clear latency penalty vs primary, but contention shifts to `11435` insight batches — plausible counterintuitive slowdown per V2b precedent, not yet proven worse; keep and monitor. Backup: revert or dedicated lightweight-utility instance if `11435` contention observed.
+
+### H2(b) — Insight embedding contention
+**Files:** `services/vectorCSV.py`/`vectorWeather.py` `OllamaEmbeddings` default host **code-derived**, `services/insight_common.py` `get_rag_context` **code-derived**
+**Measurement:** `embed_query` quiet `0.04s` **measured**, during insight `get_rag_context 0.09s` + concurrent `chat embed 0.04s` **measured** (vs old `1-2s` **industry-expectation** from B4, now `0.04s` via GPU). Not worth isolating — cheap, no measurable delay to chatbot embed during insight window. No fix.
+
+### H3 — Act on H1
+**Branch:** Generation slightly dominant overall (2/4) + 2/4 mixed, not prefill-dominant — **Branch B**. `num_predict 512→400` already applied in P3-1 **code-derived**; no further template trimming or cap `<8` without eval-flag evidence (faith LOW recurring is retrieval relevance, not latency **code-derived** noted out-of-scope). Flag distilled/smaller model for simpler queries as Phase 5 candidate **industry-expectation**, not built now. Validation: `padi 15.2s`, `pupuk 18.6s`, `cabai 11.0s` none truncated after `400` **measured**.
+
+---
+
+## Phase 5 — I1 Full-Pipeline + Final Disposition (2026-09-07)
+
+### I1 — Full-pipeline stage breakdown
+**Files:** `core/sugi_core.py:438` `STAGE_TIMING` instrumentation **code-derived** (`scope/rewrite/plant/retrieval/rerank/generation` via `time.monotonic` matching existing `[TIMING]` pattern **code-derived**)
+**Verification:** H1 bypassed `rewrite/plant/Perenual` per its own description (`raw /api/generate` **code-derived**); production logs `melon 24-51s` vs H1 `1.6-13.4s` gap **measured** signaled missing stages.
+**Measurement:** Real production queries via instrumented `ask()` **measured**:
+- melon pest `Sayakan mau panen melon...` (direct name-map hit, cache hit, no Qwen fallback **code-derived** per log) `scope 0.025s rewrite 0.000008s plant 5.08s retrieval 2.07s rerank 0.88s generation 19.44s total 27.52s` **measured** — generation `70%` dominates, plant still `5s` even on cache hit (includes `plant detection + pest/disease cache` path), retrieval `2s` consistent with historical `<1s` **measured** plus rerank; total `27.5s` matches production `24-27s`.
+- weather `cuaca hari ini...` `scope 0.0004s rewrite 0.000007s plant 1.13s retrieval 2.78s rerank 1.34s generation 4.98s total 10.24s` **measured** — generation `48%`, plant+retrieval+rerank `5.25s` non-trivial.
+- salak (no plant) `scope 0.014s plant 0.038s retrieval 1.31s rerank 0.25s generation 9.74s total 11.37s` **measured** — generation `85%`.
+- pepaya `scope 0.002s plant 1.19s retrieval 0.76s rerank 0.48s generation 6.24s total 8.69s` **measured** — generation `71%`.
+**Secondary:** `GET /api/ps` polled `1s` alongside **measured** — `sugi 2.54GB`, `embed 0.61GB` stay resident (`expires_at` rolling, no eviction) **measured** across all 4 queries; `qwen` not loaded (no fallback triggered) **measured**; tight RAM `0.57GB free` **measured** during dual load did not cause eviction in this window, so melon `19.4s` generation not explained by reload (would show `load_tensors` or missing model). H2(a) redirect already in place, but melon plant `5.08s` still on `11435` insight instance — if insight was concurrently batching, that `5s` could reflect `11435` contention, connecting to H2(a) ambiguous decision; needs per-query correlation with `11435` busy, not yet proven.
+**Conclusion:** Missing pipeline stages (plant `0.03-5s`, retrieval `0.76-2.78s`, rerank `0.25-1.34s`) explain part of H1 gap, but generation `4.98-19.44s` remains dominant for `3/4` queries (`48-85%`). For melon, generation alone `19.4s` exceeds H1 raw `6s` for same token cap `400` — points to model-state/wrapper overhead or prompt-cache miss rather than Perenual, for this specific type. Mix of explanations, not single cause — as spec required, not picking convenient one. Backup 2-marker split would have missed plant `5s` outlier.
+
+### Final Disposition — Chroma sharding / Redis stateless / Kubernetes
+**Evidence base per spec:**
+- V1b: hard ceiling artifact **measured** (`10/10` wall `45-50s` zero failures both harnesses) — degrades, not fails.
+- V2b: cheapest lever negative **measured** (`121s` vs `27s` worse).
+- G1: GPU already active `100% VRAM 4.31GB` **measured** on primary, modest gain `15.2s` vs `18.9s` **measured**.
+- G2: dual isolation net neutral `14.6s vs 14.7s` **measured**, headroom `~2.5GB` **code-derived** corrected.
+- H1/H2: context not dominant, embeddings cheap `0.04s` **measured**.
+- Traffic `~5 req/hour` every phase **measured** never near `5+` concurrent degradation curve.
+**Decision:** **Do not build** Chroma sharding (retrieval `<1s` **measured** every phase), Redis stateless (no replica need **code-derived**), Kubernetes/multi-replica (single-script 7 services reliable **code-derived**). This is a considered decision, not deferral — investment does not match current or foreseeable scale.
+**Triggers (observable, unambiguous):**
+1. Real sustained traffic regularly produces `2-3+` simultaneous concurrent requests — genuine overlapping `queries.jsonl` timestamps **measured**, not `5/hour` total.
+2. Chroma collection `10×` growth AND retrieval latency directly measured degraded — not just bigger.
+3. Second deployment target needed for business reason (geo redundancy, second interface sharing state) — not speculative.
+Until one fires, this work stays off roadmap. This doc is rationale.

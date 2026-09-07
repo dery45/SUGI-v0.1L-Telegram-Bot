@@ -107,20 +107,36 @@ def main():
 
     mgr = ServiceManager()
 
+    # P2-2: Dedicated Ollama for background insights (11435), started first so it’s ready before insight crons.
+    # Falls back safely if binary not found; insight services fallback to 11434 via OLLAMA_HOST_INSIGHT.
+    import os as _os, shutil as _sh
+    _ollama_bin = _sh.which("ollama")
+    if _ollama_bin and _os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11435") != "http://127.0.0.1:11434":
+        _insight_host = _os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11435")
+        # Extract host:port for OLLAMA_HOST env expected by `ollama serve`
+        _insight_env = {**_os.environ, "OLLAMA_HOST": _insight_host.replace("http://","").replace("https://","")}
+        print(f"🧠 Starting Insight Ollama on {_insight_host} (isolated from user Ollama 11434)...")
+        try:
+            import subprocess as _sp
+            _p = _sp.Popen([_ollama_bin, "serve"], env=_insight_env)
+            mgr.services.append({"name": "Insight Ollama (11435)", "cmd": [_ollama_bin, "serve"], "process": _p, "restarts": 0})
+        except Exception as e:
+            print(f"⚠️  Insight Ollama failed to start: {e}")
+
     # 1. Start Vector CSV/XLSX Service
-    mgr.add("Vector CSV Watcher",    [sys.executable, str(Path("services/vectorCSV.py"))])
+#    mgr.add("Vector CSV Watcher",    [sys.executable, str(Path("services/vectorCSV.py"))])
     # 2. Start Vector PDF Service
-    mgr.add("Vector PDF Watcher",    [sys.executable, str(Path("services/vectorpdf.py"))])
+#    mgr.add("Vector PDF Watcher",    [sys.executable, str(Path("services/vectorpdf.py"))])
     # 3. Start Weather Service
-    mgr.add("Weather Insight Service",[sys.executable, str(Path("services/vectorWeather.py"))])
+#    mgr.add("Weather Insight Service",[sys.executable, str(Path("services/vectorWeather.py"))])
     # 4. Start Daily Insight (MongoDB Async Pushing)
-    mgr.add("Daily Insight Cron",    [sys.executable, str(Path("services/daily_insight.py"))])
+#    mgr.add("Daily Insight Cron",    [sys.executable, str(Path("services/daily_insight.py"))])
     # 5. Start Telegram Bot
     mgr.add("Telegram Bot",          [sys.executable, str(Path("interfaces/telegram/telegram_bot.py"))])
     # 6. Start Government Insight Engine
-    mgr.add("Government Insight",    [sys.executable, str(Path("services/government_insight_service.py"))])
+#    mgr.add("Government Insight",    [sys.executable, str(Path("services/government_insight_service.py"))])
     # 7. Start Farmer Insights & Policy Recommendation Engine
-    mgr.add("Farmer Insight Engine", [sys.executable, str(Path("services/farmer_insight_service.py"))])
+#    mgr.add("Farmer Insight Engine", [sys.executable, str(Path("services/farmer_insight_service.py"))])
 
     print("\n✅ All background services initiated! (Press Ctrl+C to stop all)")
     print("   Note: Ensure 'chroma run --path data/db --port 8000' is running in a separate terminal!")

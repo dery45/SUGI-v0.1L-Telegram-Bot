@@ -19,6 +19,37 @@ Legend for source of each entry:
 
 ---
 
+## `v0.3.0` — 2026-09-07 — Scalability remediation complete (Phases 1-5: Tier 1, V1b/V2b, P2-2..P2-4, G1/G2, H1/H2/H3, I1) + performance retest [inferred]
+
+**Status:** working-tree changes (uncommitted; 4-phase scalability review + I1 instrumentation, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 294.47s, `docs/decisions.md` Phase 5, `start_all.py` dual Ollama, ThreadingHTTPServer backlog 50).
+
+### Summary
+Tier 1 fixes (backpressure/input guard/UserStore lock) + verification of review's `10-concurrent hard wall` as harness artifact + `OLLAMA_NUM_PARALLEL` negative + dual-Ollama isolation + observability + streaming + GPU correction + headroom fix + generation-length tuning + full-pipeline stage breakdown explain `20-30s` tail + final disposition not to build sharding/Redis/K8s. Performance retest with `STAGE_TIMING` shows `generation 48-85%` dominant.
+
+### Detailed changes
+- **Tier 1 (T1-1 backpressure)** — `interfaces/telegram/telegram_bot.py` `self._llm_semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_ASK","2")))` + `wait_for(0.01)` fast-fail `⏳ Sedang banyak...` **measured** `5 concurrent → 2 ok 3 busy 0.607s` (no queue to `71s` p95).
+- **T1-2 input guard** — `core/sugi_core.py:442` `MAX_QUESTION_CHARS=2000` env-tunable early return `<1ms` vs prior `120s` Ollama timeout **measured** `6000 chars → 0.00008s`.
+- **T1-3 UserStore lock** — `core/user_store.py:31` `threading.Lock` + atomic `tmp→replace` **measured** `20 threads → 21/21` no loss.
+- **V1b backlog fix** — `tests/review/test_ai_performance.py:18` + `tests/review/test_ai_scalability.py:149` `ScalabilityTestServer(request_queue_size=50)` + `ThreadingHTTPServer` (was `HTTPServer`) — corrects `request_queue_size=5` default that caused `10 ECONNREFUSED`; synthetic `0.5s` handler `10/10` at both, real `10/10 wall 45.8s Threaded / 49.7s aiohttp` **measured** `10/10 ok` (not hard wall) — severe degradation but not failure, outcome (b).
+- **V2b parallel test (negative)** — isolated `127.0.0.1:11435 OLLAMA_NUM_PARALLEL=2` second instance **measured** `2-conc 121.5s vs 27.7s`, `5-conc 123.7s vs 65.6s` **measured** (compute-bound, Vulkan already active) — Branch B keep `NUM_PARALLEL=1`.
+- **P2-2 dual Ollama** — `services/insight_common.py:27` `base_url=os.getenv("OLLAMA_HOST_INSIGHT","http://127.0.0.1:11434")` **code-derived**, `config/.env:50` `OLLAMA_HOST_INSIGHT=http://127.0.0.1:11435` **code-derived**, `start_all.py:109` second `ollama serve` **code-derived** — background `~600s/day` qwen no longer queues on `11434`; `1.1GB` qwen vs `4.31GB` primary = `5.4-5.6GB` headroom corrected from `8.6GB`.
+- **P2-3 observability** — `core/query_logger.py:14` `PROMPT_VERSION=v1` + `model_name`/`prompt_version` in trace **measured** `queries.jsonl`, `p50/p95` in `print_debug_report` **measured** (`avg10 p50 10 p95 10`), `interfaces/telegram/telegram_bot.py:140` `In-flight 0/2` in `!stats` **measured**.
+- **P2-4 streaming** — `core/sugi_core.py:437` `ask(..., on_chunk)` additive + `run_coroutine_threadsafe(edit_text, 200c/1s)` `telegram_bot.py:540` — `345` chunks for `1146` chars **measured**, OOS/length-guard `0` chunks early-return handled **measured**.
+- **G1 GPU correction** — `GET /api/ps` while in-flight polls `15× 100% VRAM` **measured** (`sugi 2.54GB`, `qwen 1.16GB`, `embed 0.61GB`), `ollama 0.33.3` both instances **measured**, prior `CPU-only` was inference not measurement — docs corrected, re-measured batch `15.2s` median vs `18.9s` historical (modest win, not transformative as warned `qwen 18-20 tok/s`).
+- **G2 headroom fix** — `services/insight_common.py:31` `keep_alive 60s` (was `5m`) **code-derived** for insight to free RAM between `3600s` cycles; `psutil` `3.8GB→0.57GB` free **measured** dual during insight load.
+- **P3-1 generation length** — `core/sugi_core.py:302` `num_predict 512→400` **code-derived** (sample `781/1059/609 chars ≈195/264/152 tok` **measured** rarely near `400`).
+- **H1 prefill vs generation** — raw `POST /api/generate` `prompt_eval/eval` **measured** `simple 53% prefill`, `weather 15%`, `pest 5%`, `complex 41%` — mixed, not prefill-dominant.
+- **H2a utility redirect** — `core/sugi_core.py:304,404` `base_url` to `11435` **code-derived**, `0` before **measured**; plant fallback `20.6s` **measured**, rewrite rule-based `0.000004s` **measured** — ambiguous helps, kept.
+- **H2b embeddings** — `embed 0.04s` quiet vs `0.09s` during insight **measured** — not worth isolating.
+- **I1 stage timing** — `core/sugi_core.py:438` `STAGE_TIMING {scope, rewrite, plant, retrieval, rerank, generation}` **measured**: melon `27.52s plant5.08 retrieval2.07 rerank0.88 gen19.44 70%`, weather `10.24s 1.13/2.78/1.34/4.98 48% gen`, salak `11.37s 0.03/1.31/0.25/9.74 85% gen`, pepaya `8.69s 1.19/0.76/0.48/6.24 71% gen`; `ps 1s` poll shows no eviction **measured**.
+- **Final disposition** — `docs/decisions.md:468` **code-derived** do not build sharding/Redis/K8s, 3 observable triggers (concurrent `2-3+` overlapping, `10×` data + measured retrieval regression, business need for second target).
+- **Performance retest** — `tests/review/test_ai_performance.py:18` updated to `ThreadingHTTPServer backlog 50`, `17/17 PASS 294.47s` **measured** vs original `315s`; report `docs/PHASE1_REVIEW_RERUN_20260907.md` **measured** (median `16.86s`, `STAGE_TIMING` dominant).
+
+### Files affected
+`core/sugi_core.py`, `core/query_logger.py`, `core/user_store.py`, `interfaces/telegram/telegram_bot.py`, `services/insight_common.py`, `config/.env`, `start_all.py`, `tests/review/test_ai_performance.py`, `tests/review/test_ai_scalability.py`, `docs/decisions.md`, `docs/PHASE1_REVIEW_RERUN_20260907.md`, `docs/CHANGELOG.md`, `README.md`, `docs/VERSIONS.md`.
+
+---
+
 ## `v0.2.3` — 2026-08-24 — Live-bug fixes: whitespace masking + data-narration openers (T1, T2) [inferred]
 
 **Status:** working-tree changes (uncommitted; live-findings round, on top of the

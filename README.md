@@ -64,19 +64,29 @@ Here is SUGI AI in action on Telegram:
 - **INI-based Configuration** → All keywords & plant maps in `config/settings/`, no code changes needed.
 - **Scope Guard** → Only answers agriculture & plantation related topics.  
 - **Offline Message Catch-up** → Telegram bot processes messages sent while offline on restart, with crash-safe offset persistence.
+- **Backpressure & Input Guard (T1-1/T1-2)** → `MAX_CONCURRENT_ASK=2` semaphore with `wait_for(0.01)` fast-fail `⏳ Sedang banyak pertanyaan...` (no queue buildup to `71s` p95); `MAX_QUESTION_CHARS=2000` early return `Maaf, pertanyaan terlalu panjang...` in `<1ms` vs prior `120s` Ollama timeout.
+- **UserStore Atomic Locking (T1-3)** → `threading.Lock` + `tmp→os.replace` atomic write — no `visit_count` loss under concurrent Telegram messages (validated `20` threads → `21/21`).
+- **GPU Acceleration (G1)** → RX 6600 8GB Vulkan, Ollama `0.33.3` `100% VRAM` (`sugi 2.54GB + qwen 1.16GB + mxbai 0.61GB =4.31GB` primary) — corrects prior `CPU-only` inference; modest `15.2s` median vs `18.9s` CPU-era.
+- **Dual-Ollama Isolation (P2-2/G2)** → `OLLAMA_HOST_INSIGHT=http://127.0.0.1:11435` + `start_all.py` second `ollama serve` (qwen `1.1GB`, `keep_alive 60s` G2) — background `~600s/day` qwen insight no longer queues on user path; `5.4-5.6GB` of `8GB` VRAM headroom (corrected from `8.6GB`).
+- **Observability (P2-3)** → `queries.jsonl` now carries `model_name`/`prompt_version` (`PROMPT_VERSION=v1`), `print_debug_report` shows `avg/p50/p95` + `Models/Prompts`, `!stats` shows live `In-flight: 0/2`.
+- **Telegram Streaming (P2-4)** → `SugiCore.ask(on_chunk)` streams `full_response` per `_live_chain.stream()` chunk → `run_coroutine_threadsafe(edit_text, 200 chars / 1s)` — perceived TTFT `0.07s` visible, final `edit_text` handles OOS/length-guard paths.
+- **Stage Timing (I1)** → `ask()` emits `[STAGE_TIMING] {scope, rewrite, plant, retrieval, rerank, generation} total` + `ThreadingHTTPServer backlog 50` (V1b) — explains `20-30s` tail (`generation 5-19s` dominant, `plant 0.03-5.0s`, `retrieval 0.6-3.9s`).
+- **Generation Tuning (P3-1)** → `num_predict 512→400` on `sugi-v0.1L` (rarely near `400` tokens `chars/4`); `V1b 10/10` wall `45-50s` not hard wall, `V2b OLLAMA_NUM_PARALLEL=2` tested negative (compute-bound, `121s` vs `27s` worse).
 
 ## Tech Stack
 
 | Component | Detail |
 |---|---|
-| **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama) |
-| **Utility Model** | `qwen2.5:1.5b` — query rewriting fallback, plant extraction, eval loop, insights |
-| **Embedding** | `mxbai-embed-large` (Ollama) |
-| **Vector Store** | ChromaDB Server mode — 6 collections |
-| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=8) — **single pass over RAG ± weather (M1 + A11)**; memory retrieved separately & user-scoped, gated by `needs_ref_context` (A10/A4) |
-| **Insight DB** | MongoDB Atlas — 7 collections across `sugi_insights` + `test` databases (write-only) |
-| **External APIs** | Open-Meteo (Free weather), Perenual (Plants & Pests) |
+| **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama 0.33.3, `num_ctx 4096` `num_predict 400` P3-1, `keep_alive 600`, `100% VRAM` Vulkan RX 6600 2.54GB) |
+| **Utility Model** | `qwen2.5:1.5b` — query rewriting fallback (`num_predict 40`, `keep_alive 600` → `60s` insight G2, `base_url` H2a on `11435`), plant extraction (`num_predict 10`), eval loop, insights (`timeout 240s`, `OLLAMA_HOST_INSIGHT`) |
+| **Embedding** | `mxbai-embed-large` (Ollama 0.61GB VRAM, `0.04s` via `OllamaEmbeddings` H2b vs `2.06s` via `/api/embed`) |
+| **Vector Store** | ChromaDB Server mode — 6 collections (`main_dataset` 368k, `langchain` 77k), `ThreadingHTTPServer` backlog 50 `ScalabilityTestServer` (V1b) |
+| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=8) — **single pass over RAG ± weather (M1 + A11)**; memory retrieved separately & user-scoped, gated by `needs_ref_context` (A10/A4); `retrieval 0.63-3.92s` + `rerank 0.16-1.34s` (I1) |
+| **Insight DB** | MongoDB Atlas — 7 collections across `sugi_insights` + `test` databases (write-only), `keep_alive 60s` insight, `OLLAMA_HOST_INSIGHT=11435` dual (P2-2) |
+| **External APIs** | Open-Meteo (Free weather), Perenual (Plants & Pests, `429` trip 1h fast-fail `0.003s` vs `2.38s` miss) |
 | **Framework** | LangChain, LangChain-Classic |
+| **Observability** | `PROMPT_VERSION=v1`, `model_name` in `queries.jsonl`, `p50/p95` in `!debug`, `In-flight 0/2` in `!stats`, `[STAGE_TIMING]` 6 stages (I1) |
+| **Orchestration** | `start_all.py` 8 services (added Insight Ollama 11435) + `ThreadingHTTPServer` + `asyncio.Semaphore(2)` T1-1 + `run_coroutine_threadsafe` streaming P2-4 |
 
 ---
 
@@ -149,6 +159,9 @@ Data consumed by external dashboards — zero reads from chatbot application.
 | `STARTUP_GRACE_SECONDS` | No | `180` | Fallback grace for all services (A8) |
 | `INSIGHT_LLM_DELAY` | No | `1` | Seconds between insight LLM calls (A8/A12); `0` = off |
 | `DAILY_INSIGHT_MAX_WORKERS` | No | `1` | Daily insight LLM workers (A12): `1` = sequential + pacing; `>1` = bounded thread pool |
+| `MAX_CONCURRENT_ASK` | No | `2` | Backpressure semaphore `asyncio.Semaphore(2)` + `wait_for 0.01` fast-fail busy `⏳` (T1-1) |
+| `MAX_QUESTION_CHARS` | No | `2000` | Input length guard early return `<1ms` vs `120s` timeout (T1-2) |
+| `OLLAMA_HOST_INSIGHT` | No | `http://127.0.0.1:11435` | Insight `qwen` Ollama host (P2-2) — fallback `11434` if unset; `keep_alive 60s` G2 |
 
 ### `config/settings/scope_config.ini` — Domain Guard
 
@@ -179,23 +192,29 @@ User Question
     │
     ▼
 ┌─────────────────────────────────────────────┐
-│ [1] SCOPE GUARD                              │
+│ [0] INPUT GUARDS                             │
+│   ├── MAX_QUESTION_CHARS 2000 → early return │  T1-2
+│   └── MAX_CONCURRENT_ASK 2 → busy 0.01s     │  T1-1  (Telegram semaphore)
+└───────────────────┬─────────────────────────┘
+                    ▼
+┌─────────────────────────────────────────────┐
+│ [1] SCOPE GUARD                              │  I1 scope 0.00-0.02s
 │   ├── Greeting check → bypass scope          │
-│   ├── Blocked keywords → REFUSAL             │
+│   ├── Blocked keywords → REFUSAL (34ms)      │
 │   ├── Allowed keywords → continue            │
 │   └── No match → REFUSAL                     │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [2] QUERY REWRITING (3-layer)                │
+│ [2] QUERY REWRITING (3-layer)                │  I1 rewrite 0.000004-0.04s
 │   ├── Layer 1: Definitional? ("apa itu X")   │
 │   │   └── Yes → skip rewrite, return original│
 │   ├── Layer 2: Has referential word?         │
 │   │   ├── No → skip rewrite                  │
-│   │   └── Yes → Rule-based rewrite (0ms)     │
+│   │   └── Yes → Rule-based rewrite (0ms)     │  on 11435 H2a
 │   │       ├── Suffix-based ("menanamnya")    │
 │   │       └── Word-replace ("itu")           │
-│   └── Layer 3: Ambiguous? → Qwen2.5 LLM     │
+│   └── Layer 3: Ambiguous? → Qwen2.5 LLM     │  11435, 2.31s
 │       └── Timeout/fail → use original query  │
 │                                              │
 │   Scope re-check: suffix rewrites can bypass │
@@ -203,52 +222,53 @@ User Question
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [3] PLANT & WEATHER DETECTION                │
-│   ├── Plant: strong keyword? → plant API     │
+│ [3] PLANT & WEATHER DETECTION                │  I1 plant 0.03-5.08s
+│   ├── Plant: strong keyword? → plant API     │  11435 H2a, 429 trip 1h
 │   │   ├── weak + strong? → plant API         │
 │   │   ├── weak only? → skip plant API        │
-│   │   └── Plant name extraction → Perenual   │
+│   │   └── Plant name extraction → Perenual   │  Qwen 11435, 10 tok
 │   └── Weather: keyword match? → weather docs │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [4] HYBRID RETRIEVAL                         │
+│ [4] HYBRID RETRIEVAL ± STAGE TIMING          │  I1 retrieval 0.63-3.92s
 │   ├── BM25 Retriever (k=4)                   │
-│   ├── Vector Retriever (k=4)                 │
+│   ├── Vector Retriever (k=4)                 │  embed 0.04s H2b (GPU)
 │   ├── Plant Retriever (k=3, if plant query)  │
-│   └── Memory Search (k=2, if referential)    │
-│                                              │
+│   └── Memory Search (k=2, if referential)    │  needs_ref_context A10
 │   Ensemble weights: base 0.60, plant 0.15    │
-│   (memory is searched separately & gated by  │
-│    needs_ref_context — A10/A4)               │
+│   ThreadingHTTPServer backlog 50 V1b          │
+│   [STAGE_TIMING] plant/retrieval/rerank      │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [5] CROSS-ENCODER RERANKER                   │
-│   └── ms-marco-MiniLM-L-6-v2, top_n=8       │
+│ [5] CROSS-ENCODER RERANKER                   │  I1 rerank 0.16-1.34s
+│   └── ms-marco-MiniLM-L-6-v2, top_n=8       │  load 3.89s cold
 │   └── single pass over RAG ± weather (A11)  │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [6] LLM GENERATION                           │
-│   ├── Answer template with date/time/context │
-│   ├── 8000-char input truncation             │
-│   ├── 4096 token context window              │
-│   └── Streaming output                       │
+│ [6] LLM GENERATION                           │  I1 generation 4.98-19.44s (48-85%)
+│   ├── Answer template v1 + date/time/context │  PROMPT_VERSION v1, num_predict 400 P3-1
+│   ├── 4096 token context window              │  8 chunks cap M2
+│   └── Streaming on_chunk 200c/1s → edit_text │  P2-4 run_coroutine_threadsafe
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [7] EVAL LOOP                                │
-│   ├── Lexical faithfulness check (fast)      │
-│   ├── Lexical relevance check (fast)         │
-│   └── Qwen2.5 LLM eval (if inconclusive)     │
+│ [7] EVAL LOOP (background daemon)            │
+│   ├── Lexical faithfulness 0.50/0.25 S1      │
+│   ├── Lexical relevance 0.50/0.25            │
+│   └── Qwen2.5 LLM eval if inconclusive      │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [8] PERSISTENCE                              │
-│   ├── Append log to queries.jsonl            │
-│   ├── Flagged? → Append to eval_flags.jsonl  │
-│   └── Every 5 turns → save session memory    │
+│ [8] PERSISTENCE + OBSERVABILITY              │
+│   ├── Append queries.jsonl (model_name,      │  P2-3
+│   │   prompt_version, latency_ms)            │
+│   ├── Flagged? → eval_flags.jsonl            │
+│   ├── Every 5 turns → session memory         │
+│   ├── !debug → p50/p95 16.86/48.38s          │  2026-09-07 retest
+│   └── !stats → In-flight 0/2                │  P2-3
 └─────────────────────────────────────────────┘
 ```
 
@@ -500,10 +520,11 @@ Evaluated on:
 
 > Full details live in: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (detailed chronological changelog — the **only** tracked file in `docs/`; the rest is internal-only) and [`docs/VERSIONS.md`](docs/VERSIONS.md) (concise overview, git-ignored).
 
-**Current status:** v0.2.3 (uncommitted working tree; committed HEAD v0.2.0 — `3d5cdff`, 2026-08-12)
+**Current status:** v0.3.0 (working tree; HEAD `3d5cdff` v0.2.0, 2026-08-12) — Phase 1-5 scalability remediation complete (see decisions.md Phase 5 I1 + final disposition)
 
 | Version | Date | Status | Summary |
 |---|---|---|---|
+| **v0.3.0** | 2026-09-07 | ⏳ Working tree (Phase 1-5) | **Scalability remediation complete:** T1-1 backpressure `MAX_CONCURRENT_ASK=2` (0.607s `2 ok 3 busy`), T1-2 input guard `2000` (`<1ms` vs `120s`), T1-3 `UserStore` lock+atomic; V1b `backlog 50` corrects `10/10` wall `45-50s` not hard wall; V2b `OLLAMA_NUM_PARALLEL=2` negative `121s` vs `27s` (compute-bound, keep `1`); P2-2 dual Ollama `11435` (`1.1GB` qwen `keep_alive 60s` G2, `5.4-5.6GB` VRAM headroom corrected); P2-3 observability `model_name`/`prompt_version` `p50/p95` `In-flight`; P2-4 streaming `on_chunk 200c/1s`; G1 GPU `100% VRAM` Vulkan RX 6600 (`15.2s` median); H1 prefill `0.2-7.1s` vs generation `5.9s` mixed; H2a utility redirect to `11435` (ambiguous), H2b embed `0.04s` not worth; P3-1 `num_predict 400`; I1 `STAGE_TIMING` 6 stages explains `20-30s` tail (`generation 48-85%`); Final disposition: **do not build** sharding/Redis/K8s — 3 triggers gated |
 | **v0.2.3** | 2026-08-24 | ⏳ Working tree (T1–T2) | T1 whitespace normalization at `ask()` entry (fixes "hari  ini" double-space → false referential → Qwen timeout → memory injection); T2 data-narration removal: prompt hardening (silent gap-fill, silent history, forbidden-opener list, anti-refusal backstop) + runtime post-filter `_strip_data_narration()` strips "Saya tidak menemukan informasi", "Berdasarkan riwayat...", anti-refusal backstop |
 | **v0.2.2** | 2026-08-18 | ⏳ Working tree (N1, S1, S2) | N1 province metadata hoist for price insights (hoist `province` to chunk metadata + schema-versioned R4 reindex), S1 stemmed lexical eval overlap (Sastrawi `_stem_tokens`, graceful fallback, thresholds 0.50/0.25, thread lock), S2 scalability roadmap decision recorded (Option B: descoped Redis sessions + second Ollama at current scale) |
 | **v0.2.1** | 2026-08-12 | ⏳ Working tree (R1–R4 + Q1–Q2) | R1 fail-closed debug access (`DEBUG_ALLOWED_USERS` deny-by-default + startup warning), R2 `blocked_kw` enforced (blocked overrides allowed), R3 global Telegram error handler (fallback reply instead of silence), R4 content-hash re-index dedup (CSV/XLSX/PDF `file_hash`, delete+reindex on change) + BM25 invalidation backfill for PDFs, Q1 tag comments consolidated into `docs/decisions.md`, Q2 duplicated insight helpers extracted into shared `services/insight_common.py` (per-service k/label/truncation preserved) |
@@ -526,4 +547,4 @@ Evaluated on:
 ## License
 MIT License.
 
-Last updated: August 2026 · v0.1L (Scope-Hardened) · Changelog v0.2.3 · RAG Score 94/100
+Last updated: 2026-09-07 · v0.3.0 (Scalability Remediation Complete — Phase 1-5, I1 final) · `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 294s · RAG Score 94/100
