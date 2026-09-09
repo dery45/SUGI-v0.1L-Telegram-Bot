@@ -41,11 +41,11 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+# ─── Configuration (filled via config/.env — see config/.env.example) ───────
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "mxbai-embed-large")
-LATITUDE       = float(os.getenv("LATITUDE", "-7.774756"))
-LONGITUDE      = float(os.getenv("LONGITUDE", "110.388836"))
-LOCATION_NAME  = os.getenv("LOCATION_NAME", "Yogyakarta")
+LATITUDE       = float(os.getenv("LATITUDE", "-7.774756"))  # env: LATITUDE
+LONGITUDE      = float(os.getenv("LONGITUDE", "110.388836"))  # env: LONGITUDE
+LOCATION_NAME  = os.getenv("LOCATION_NAME", "Yogyakarta")  # env: LOCATION_NAME
 
 PAST_DAYS      = int(os.getenv("PAST_DAYS", "92"))
 FORECAST_DAYS  = int(os.getenv("FORECAST_DAYS", "16"))
