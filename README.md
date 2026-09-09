@@ -302,7 +302,7 @@ CLI-only commands: `q` (quit), `clear` (reset session), `history` (show past con
   ```bash
   ollama pull llama3.2
   ollama pull qwen2.5:1.5b
-  ollama create sugi-v0.1L -f Modelfile
+  ollama create sugi-v0.1L -f config/Modelfile
   ollama pull mxbai-embed-large
   ```
 
