@@ -43,7 +43,7 @@ import concurrent.futures
 if os.path.dirname(os.path.dirname(os.path.abspath(__file__))) not in sys.path:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from services.insight_common import build_insight_llm, ping_with_retry
+from services.insight_common import build_insight_llm, ping_with_retry, wait_if_busy
 
 # ── Env loading ───────────────────────────────────────────────────────────────
 try:
@@ -87,24 +87,39 @@ except ImportError:
 
 def _build_mongo_client() -> MongoClient:
     """
-    Buat MongoClient dengan konfigurasi TLS yang benar untuk MongoDB Atlas.
+    Buat MongoClient dengan konfigurasi TLS yang benar.
 
-    - tlsCAFile=certifi.where()      → pakai CA bundle dari certifi (up-to-date)
-    - tlsAllowInvalidCertificates=False → validasi sertifikat dengan benar (JANGAN True)
-    - tls=True                       → aktifkan TLS secara eksplisit
-    - retryWrites=True               → retry otomatis pada transient error
+    - Jika URI mengandung tls=false/ssl=false → jangan pakai TLS (untuk self-hosted
+      tanpa TLS seperti sugiecosystem.cloud). Ini yang menyebabkan SSL handshake
+      error sebelumnya: kode memaksa tls=True padahal URI minta tls=false.
+    - Jika TLS aktif (Atlas) → pakai certifi CA bundle + validasi ketat.
     """
-    return MongoClient(
-        MONGO_URI,
-        serverSelectionTimeoutMS=15_000,
-        socketTimeoutMS=20_000,
-        connectTimeoutMS=20_000,
-        tls=True,
-        tlsCAFile=certifi.where(),
-        tlsAllowInvalidCertificates=False,   # ← WAJIB False agar handshake benar
-        retryWrites=True,
-        retryReads=True,
-    )
+    # Hormati tls=false di URI — jangan override dengan tls=True
+    uri_lower = MONGO_URI.lower()
+    use_tls = "tls=false" not in uri_lower and "ssl=false" not in uri_lower
+
+    if use_tls:
+        return MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15_000,
+            socketTimeoutMS=20_000,
+            connectTimeoutMS=20_000,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=False,
+            retryWrites=True,
+            retryReads=True,
+        )
+    else:
+        # Self-hosted tanpa TLS — jangan kirim opsi TLS sama sekali
+        return MongoClient(
+            MONGO_URI,
+            serverSelectionTimeoutMS=15_000,
+            socketTimeoutMS=20_000,
+            connectTimeoutMS=20_000,
+            retryWrites=True,
+            retryReads=True,
+        )
 
 
 try:
@@ -216,6 +231,8 @@ def _run_paced(items: list, worker_fn) -> list:
     Default 1 = berurutan + jeda INSIGHT_LLM_DELAY; >1 = thread pool eksplisit.
     See docs/decisions.md#a12
     """
+    # Part0: defer if chatbot busy (inter-process signal)
+    wait_if_busy("daily", max_wait=60)
     max_workers = DAILY_INSIGHT_MAX_WORKERS
     if max_workers > 1:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -224,6 +241,8 @@ def _run_paced(items: list, worker_fn) -> list:
     results = []
     total = len(items)
     for i, item in enumerate(items):
+        # Part0: check busy before each LLM call in paced loop
+        wait_if_busy("daily", max_wait=30)
         results.append(worker_fn(item))
         if i < total - 1 and INSIGHT_LLM_DELAY > 0:
             time.sleep(INSIGHT_LLM_DELAY)

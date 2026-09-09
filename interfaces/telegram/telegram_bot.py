@@ -27,6 +27,7 @@ import sys
 import os
 import json
 import asyncio
+import threading
 import time
 import httpx
 from pathlib import Path
@@ -133,6 +134,12 @@ class SugiTelegramBot:
         self.sugi  = SugiCore()
         self.users = UserStore()
         self._last_request: dict[str, float] = {}
+        # T1-1: Backpressure — bound concurrent sugi.ask() to fail fast with 429-style busy.
+        # Uses wait_for(timeout=0.01) to avoid check-then-acquire race; tunable via env.
+        self._llm_semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENT_ASK", "2")))
+        # P2-3: live concurrency visibility — manual counter (don't read semaphore._value)
+        self._in_flight = 0
+        self._in_flight_lock = threading.Lock()
         print("🤖  Sugi Telegram Bot initialized.")
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -506,6 +513,12 @@ class SugiTelegramBot:
                 self.sugi.handle_debug_command, question, user_id
             )
             if handled:
+                # P2-3: surface live in-flight for !stats
+                if question.strip().lower() == "!stats":
+                    max_conc = int(os.getenv("MAX_CONCURRENT_ASK", "2"))
+                    with self._in_flight_lock:
+                        infl = self._in_flight
+                    output = (output or "") + f"\nIn-flight requests: {infl}/{max_conc}"
                 await self._send_long(update, output or "✅ Done.")
             else:
                 await update.message.reply_text(
@@ -515,6 +528,41 @@ class SugiTelegramBot:
             return
 
         # ── Pertanyaan biasa ──────────────────────────────────────────────────
+        # T1-1: Backpressure — fail fast if too many concurrent asks.
+        # Uses wait_for to acquire atomically with timeout, avoiding locked() race.
+        try:
+            await asyncio.wait_for(self._llm_semaphore.acquire(), timeout=0.01)
+        except asyncio.TimeoutError:
+            await update.message.reply_text(
+                "⏳ Sedang banyak pertanyaan masuk, mohon tunggu sebentar dan coba lagi."
+            )
+            return
+
+        # P2-3: in-flight counter — increment atomically with semaphore
+        with self._in_flight_lock:
+            self._in_flight += 1
+
+        # P2-4: Streaming — placeholder + incremental edits (200 chars / 1s guard)
+        # Fixes perceived latency: user sees partial text as soon as LLM starts streaming,
+        # not after full 10-70s generation. TTFT = first token → first edit round-trip.
+        loop = asyncio.get_running_loop()
+        sent_message = await update.message.reply_text("🤖 Sedang memproses...")
+        last_edit_len = 0
+        last_edit_time = 0.0
+        EDIT_CHUNK_CHARS = 200
+        EDIT_MIN_INTERVAL = 1.0
+
+        def on_chunk(accumulated_text: str):
+            nonlocal last_edit_len, last_edit_time
+            now = time.monotonic()
+            if (len(accumulated_text) - last_edit_len >= EDIT_CHUNK_CHARS
+                    and now - last_edit_time >= EDIT_MIN_INTERVAL):
+                last_edit_len = len(accumulated_text)
+                last_edit_time = now
+                asyncio.run_coroutine_threadsafe(
+                    sent_message.edit_text(accumulated_text[:4096]), loop
+                )
+
         stop_typing = asyncio.Event()
         typing_task = asyncio.create_task(
             self._keep_typing(update.effective_chat.id, context.bot, stop_typing)
@@ -528,13 +576,28 @@ class SugiTelegramBot:
                 user_id  = user_id,
                 question = question,
                 platform = "telegram",
+                on_chunk = on_chunk,
             )
         finally:
+            with self._in_flight_lock:
+                self._in_flight -= 1
+            self._llm_semaphore.release()
             stop_typing.set()
             await typing_task
         print(f"[TIMING] Telegram to_thread(ask) awaited {time.monotonic() - _tg_start:.2f}s")
 
-        await self._send_long(update, response)
+        # Final awaited edit — handles early-return paths (out-of-scope, T1-2 guard)
+        # where on_chunk never fired. Overflow beyond 4096 via _send_long.
+        try:
+            await sent_message.edit_text(response[:4096])
+        except Exception:
+            await self._send_long(update, response)
+            return
+        if len(response) > 4096:
+            # Overflow chunked as additional messages
+            remaining = response[4096:]
+            for i in range(0, len(remaining), MAX_MESSAGE_LENGTH):
+                await update.message.reply_text(remaining[i:i+MAX_MESSAGE_LENGTH])
 
     # ─────────────────────────────────────────────────────────────────────────
     # Helper: typing indicator loop

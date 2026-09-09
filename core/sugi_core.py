@@ -23,6 +23,7 @@ import configparser as _cp
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Optional
 
 from dotenv import load_dotenv
 
@@ -36,6 +37,7 @@ from langchain_ollama import OllamaEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
+from langchain_core.callbacks import BaseCallbackHandler
 
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.cross_encoders import HuggingFaceCrossEncoder
@@ -50,6 +52,18 @@ from core.query_logger import (
     new_query_trace, set_docs, commit_trace,
     print_debug_report, flagged_logs, session_logs,
 )
+
+# PF2-3: handler to capture Ollama prompt_eval vs eval from streaming call
+class _OllamaStatsHandler(BaseCallbackHandler):
+    def __init__(self):
+        self.generation_info: dict = {}
+    def on_llm_end(self, response, **kwargs):
+        try:
+            gi = response.generations[0][0].generation_info
+            if gi:
+                self.generation_info = gi
+        except Exception:
+            pass
 
 # ─────────────────────────────────────────────
 # Config — semua dari .env
@@ -67,6 +81,23 @@ MEMORY_TTL_DAYS     = int(os.getenv("MEMORY_TTL_DAYS", "14"))
 
 _chroma_client = _chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
 embeddings     = OllamaEmbeddings(model=EMBED_MODEL)
+
+# Part0: busy signal helpers (inter-process, per-request file)
+_BUSY_DIR = _ROOT / "data" / "busy"
+def _busy_mark(user_id: str, question: str):
+    try:
+        _BUSY_DIR.mkdir(parents=True, exist_ok=True)
+        p = _BUSY_DIR / f"{user_id}_{time.time_ns()}_{threading.get_ident()}.flag"
+        p.write_text(f"{user_id} {question[:50]} {datetime.now().isoformat()}", encoding="utf-8")
+        return p
+    except Exception:
+        return None
+def _busy_unmark(p):
+    try:
+        if p is not None and p.exists():
+            p.unlink()
+    except Exception:
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -271,6 +302,9 @@ _ANSWER_TEMPLATE_BASE = (
 )
 
 
+# P2-3: prompt versioning — bump when _ANSWER_TEMPLATE_BASE changes materially
+PROMPT_VERSION = "v1"
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SUGI CORE CLASS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -295,13 +329,15 @@ class SugiCore:
             repeat_penalty = 1.15,
             keep_alive     = 600,   # residensi 10 menit (C2) — see docs/decisions.md#c2
             num_ctx        = 4096,  # stability guard (C3)
-            num_predict    = 512,   # batas token output (C3)
+            num_predict    = 400,   # P3-1: tightened from 512 (rarely near ceiling) to bound worst-case
+            client_kwargs  = {"timeout": 180},  # PF2-V1: reconciled vs full history p95 51s max recent 140s (valid scope True) + margin
         )
         self.rewrite_model = OllamaLLM(
             model          = UTILITY_MODEL,
             temperature    = 0,
             keep_alive     = 600,   # seragam dgn self.model (C2)
             num_predict    = 40,    # bounded worst-case cost (B1)
+            base_url       = os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11434"),  # H2a: isolate utility from primary
             client_kwargs  = {"timeout": 30},  # D2: timeout via httpx client
         )
 
@@ -363,10 +399,21 @@ class SugiCore:
             self.plant_retriever = self.plant_store.as_retriever(search_kwargs={"k": 3})
 
         # ── Reranker ──────────────────────────────────────────────────────────
-        print("🧠  Loading Reranker...")
-        _reranker = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
-        # M1: top_n=8 agar hasil rerank weather+RAG muat. See docs/decisions.md#m1
-        self.compressor = CrossEncoderReranker(model=_reranker, top_n=8)
+        # QW-3: overlapped background load (was 3.89s serial)
+        print("🧠  Loading Reranker (background)...")
+        self.compressor = None
+        self._reranker_ready = threading.Event()
+        def _load_reranker():
+            try:
+                _reranker = HuggingFaceCrossEncoder(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
+                self.compressor = CrossEncoderReranker(model=_reranker, top_n=8)
+                print("✅  Reranker ready (background).")
+            except Exception as e:
+                print(f"⚠️  Reranker load failed: {e}")
+                self.compressor = None
+            finally:
+                self._reranker_ready.set()
+        threading.Thread(target=_load_reranker, daemon=True).start()
 
         # ── Config files ──────────────────────────────────────────────────────
         _scope_path = _ROOT / SCOPE_CONFIG_PATH
@@ -399,6 +446,7 @@ class SugiCore:
             temperature    = 0,
             keep_alive     = 600,                    # residensi seragam (C2)
             num_predict    = 10,                     # cap ketat 1-3 kata nama tanaman
+            base_url       = os.getenv("OLLAMA_HOST_INSIGHT", "http://127.0.0.1:11434"),  # H2a: isolate utility from primary
             client_kwargs  = {"timeout": 30},        # D2: timeout via httpx client
         )
         self._plant_fallback_chain = (
@@ -425,19 +473,44 @@ class SugiCore:
 
         print("✅  SugiCore ready.\n")
 
+        # QW-5: warm primary model after startup (2.6× warmup 11.87→4.48s)
+        def _warm():
+            try:
+                # throwaway minimal generation to force GPU-resident
+                self.model.invoke("Halo", config={"callbacks":[]})
+                print("🔥  Warm-up done (model GPU-resident).")
+            except Exception as e:
+                print(f"⚠️  Warm-up failed: {e}")
+        threading.Thread(target=_warm, daemon=True).start()
+
     # ═══════════════════════════════════════════════════════════════════════════
     # PUBLIC API
     # ═══════════════════════════════════════════════════════════════════════════
 
-    def ask(self, user_id: str, question: str, platform: str = "cli") -> str:
+    def ask(self, user_id: str, question: str, platform: str = "cli",
+            on_chunk: Optional[Callable[[str], None]] = None) -> str:
         """
         Proses pertanyaan dari user dan kembalikan jawaban sebagai string.
         Dipakai oleh CLI (main.py) dan Telegram (telegram_bot.py).
+        P2-4: on_chunk(accumulated_text) called per stream chunk for Telegram streaming;
+              additive and backward-compatible (CLI doesn't pass it).
         """
+        # Part0: busy signal before any early return (inter-process)
+        _busy_path = _busy_mark(user_id, question)
+        degraded_mode = False  # P4-5: set True if Chroma fallback activates
         # T1: normalize whitespace upfront so all downstream exact-substring
         # phrase matchers (_TIME_PHRASES, WEATHER_KEYWORDS, etc.) are robust
         # against double spaces, tabs, newlines from mobile keyboards.
         question = re.sub(r"\s+", " ", question).strip()
+        # T1-2: Input Length Guard — bound worst-case compute before any
+        # embedding/retrieval/LLM work. Env-tunable, fails fast.
+        _max_chars = int(os.getenv("MAX_QUESTION_CHARS", "2000"))
+        if len(question) > _max_chars:
+            _busy_unmark(_busy_path)
+            return (
+                f"Maaf, pertanyaan terlalu panjang (maksimal {_max_chars} karakter). "
+                f"Coba persingkat pertanyaan Anda."
+            )
 
         session           = self._get_or_create_session(user_id)
         trace             = new_query_trace(session["session_id"])
@@ -445,6 +518,10 @@ class SugiCore:
         is_greeting_q     = self._is_greeting(question)
 
         _local_start = time.monotonic()  # D1: ukur ask() mandiri. See docs/decisions.md#d1
+        # I1: stage breakdown — lightweight per-stage timing
+        _t = {}
+        _mark = lambda name: _t.__setitem__(name, time.monotonic())
+        _mark("start")
 
         full_response = ""
         error_msg     = None
@@ -453,6 +530,7 @@ class SugiCore:
             # ── [1] Scope check ───────────────────────────────────────────────
             print("🛡️  Checking scope...")
             in_scope = self._is_in_scope(question)
+            _mark("scope_done")
             
             history_text = self._format_history(session["history"])
             has_history  = len(session["history"]) > 0
@@ -468,6 +546,7 @@ class SugiCore:
                 if rewrite_type == "suffix":
                     print("   [scope] original failed — checking rewritten (suffix-only)...")
                     in_scope = self._is_in_scope(standalone_query)
+            _mark("rewrite_done")
             
             trace["scope_passed"] = in_scope
             trace["rewritten"]    = standalone_query
@@ -475,6 +554,7 @@ class SugiCore:
             if not in_scope:
                 print(f"🚫  Out of scope.")
                 commit_trace(trace)
+                _busy_unmark(_busy_path)
                 return self.refusal_msg
 
             # A9: history disuntik hanya untuk pertanyaan referensial. See docs/decisions.md#a9
@@ -519,6 +599,7 @@ class SugiCore:
 
             if include_weather:
                 print("🌤️  Weather query detected.")
+            _mark("plant_done")
 
             # ── Retrieval ─────────────────────────────────────────────────────
             print("🗂️  Retrieving and reranking documents...")
@@ -527,52 +608,113 @@ class SugiCore:
                 include_plant   = include_plant,
             )
 
+            # P4-5: Chroma SPOF fallback — BM25-only degraded mode if vector fails
+            degraded_mode = False
             # B4: embed sekali, reuse untuk weather & memory. See docs/decisions.md#b4
-            query_vec = embeddings.embed_query(standalone_query)
+            try:
+                query_vec = embeddings.embed_query(standalone_query)
+            except Exception as _embed_err:
+                print(f"⚠️  Chroma embed failed ({_embed_err}) — falling back to BM25-only")
+                degraded_mode = True
+                query_vec = None
+                weather_docs, rag_docs, mem_docs = [], [], []
+                try:
+                    rag_docs = self.bm25_retriever.invoke(standalone_query)
+                    print(f"🎯  BM25-only fallback: {len(rag_docs)} docs")
+                except Exception as _bm25_err:
+                    print(f"   ⚠️  BM25 fallback also failed: {_bm25_err}")
+                    rag_docs = []
+                _mark("retrieval_done")
+                # Skip vector/weather/memory, go directly to rerank
+                weather_docs = []
+                mem_docs = []
+            else:
+                # B5: pencarian independen paralel. See docs/decisions.md#b5
+                weather_docs, rag_docs, mem_docs = [], [], []
+                try:
+                    with ThreadPoolExecutor(max_workers=3) as pool:
+                        weather_future = (
+                            pool.submit(
+                                self.weather_store.similarity_search_by_vector, query_vec, k=8
+                            )
+                            if include_weather and self.weather_store and query_vec is not None
+                            else None
+                        )
+                        rag_future = pool.submit(retriever_obj.invoke, standalone_query)
+                        # A10: memory search & merge hanya utk pertanyaan referensial (pintang A9)
+                        # — bukan flag has_history yang kasar. See docs/decisions.md#a10
+                        mem_future = (
+                            pool.submit(
+                                self.memory_store.similarity_search_by_vector,
+                                query_vec, k=2, filter={"user_id": user_id},
+                            )
+                            if needs_ref_context and query_vec is not None
+                            else None
+                        )
 
-            # B5: pencarian independen paralel. See docs/decisions.md#b5
-            weather_docs, rag_docs, mem_docs = [], [], []
-            with ThreadPoolExecutor(max_workers=3) as pool:
-                weather_future = (
-                    pool.submit(
-                        self.weather_store.similarity_search_by_vector, query_vec, k=8
-                    )
-                    if include_weather and self.weather_store
-                    else None
-                )
-                rag_future = pool.submit(retriever_obj.invoke, standalone_query)
-                # A10: memory search & merge hanya utk pertanyaan referensial (pintang A9)
-                # — bukan flag has_history yang kasar. See docs/decisions.md#a10
-                mem_future = (
-                    pool.submit(
-                        self.memory_store.similarity_search_by_vector,
-                        query_vec, k=2, filter={"user_id": user_id},
-                    )
-                    if needs_ref_context
-                    else None
-                )
-
-                if weather_future:
-                    weather_docs = weather_future.result()
-                    print(f"🌤️  Weather docs: {len(weather_docs)}")
-                rag_docs = rag_future.result()
-                if mem_future:
+                        if weather_future:
+                            try:
+                                weather_docs = weather_future.result()
+                                print(f"🌤️  Weather docs: {len(weather_docs)}")
+                            except Exception as _w_err:
+                                print(f"   ⚠️  Weather retrieval failed — BM25-only for weather: {_w_err}")
+                                weather_docs = []
+                        try:
+                            rag_docs = rag_future.result()
+                        except Exception as _rag_err:
+                            print(f"⚠️  Vector retrieval failed ({_rag_err}) — BM25-only fallback")
+                            degraded_mode = True
+                            try:
+                                rag_docs = self.bm25_retriever.invoke(standalone_query)
+                                print(f"🎯  BM25-only fallback: {len(rag_docs)} docs")
+                            except Exception as _bm25_err2:
+                                print(f"   ⚠️  BM25 fallback also failed: {_bm25_err2}")
+                                rag_docs = []
+                        if mem_future:
+                            try:
+                                mem_docs = mem_future.result()
+                            except Exception as _mem_err:
+                                print(f"   ⚠️  Memory recall error: {_mem_err}")
+                except Exception as _par_err:
+                    print(f"⚠️  Parallel retrieval failed ({_par_err}) — BM25-only")
+                    degraded_mode = True
                     try:
-                        mem_docs = mem_future.result()
-                    except Exception as _mem_err:
-                        print(f"   ⚠️  Memory recall error: {_mem_err}")
+                        rag_docs = self.bm25_retriever.invoke(standalone_query)
+                    except Exception:
+                        rag_docs = []
+                _mark("retrieval_done")
 
             # A11/M1: ensemble TANPA compression wrapper → rerank TEPAT SATU KALI di sini.
             # See docs/decisions.md#a11
             combined_candidates = weather_docs + rag_docs
-            # O1: ukur biaya reranker dalam isolasi. See docs/decisions.md#o1
-            _t_rerank = time.monotonic()
-            reranked = list(self.compressor.compress_documents(
-                combined_candidates, standalone_query
-            ))
-            print(f"🎯  Re-ranked {len(combined_candidates)} candidates → "
-                  f"{len(reranked)} "
-                  f"({time.monotonic() - _t_rerank:.2f}s)")
+            # QW-3: wait for background reranker if needed, fallback to no-rerank
+            if self.compressor is None:
+                if not self._reranker_ready.wait(timeout=10):
+                    print("⚠️  Reranker not ready after 10s — proceeding without rerank")
+                    reranked = combined_candidates[:6]
+                    _t_rerank = time.monotonic()
+                else:
+                    if self.compressor is None:
+                        reranked = combined_candidates[:6]
+                        _t_rerank = time.monotonic()
+                    else:
+                        _t_rerank = time.monotonic()
+                        reranked = list(self.compressor.compress_documents(
+                            combined_candidates, standalone_query
+                        ))
+                print(f"🎯  Re-ranked {len(combined_candidates)} candidates → "
+                      f"{len(reranked)} "
+                      f"({time.monotonic() - _t_rerank:.2f}s)")
+            else:
+                # O1: ukur biaya reranker dalam isolasi. See docs/decisions.md#o1
+                _t_rerank = time.monotonic()
+                reranked = list(self.compressor.compress_documents(
+                    combined_candidates, standalone_query
+                ))
+                print(f"🎯  Re-ranked {len(combined_candidates)} candidates → "
+                      f"{len(reranked)} "
+                      f"({time.monotonic() - _t_rerank:.2f}s)")
+            _mark("rerank_done")
             ordered_candidates = reranked
 
             # Dedup by content hash
@@ -599,7 +741,8 @@ class SugiCore:
                     print(f"💾  Injected {len(new_mem)} memory doc(s) from long-term store.")
 
             # B8 (M2): cap context 8 chunk. See docs/decisions.md#b8
-            all_docs = all_docs[:8]
+            # Part4: trimmed to 6 (PF2-3 prefill 40-73% evidence, prompt 3714→~2900 toks, saves ~1.5s prefill)
+            all_docs = all_docs[:6]
 
             context = self._format_docs(all_docs) if all_docs else "Tidak ada data relevan di database."
             print(f"📊  Found {len(all_docs)} chunks " 
@@ -610,15 +753,67 @@ class SugiCore:
             # ── [5] Generate dengan answer template detail ────────────────────
             print("🤖  Generating answer:\n")
             _live_chain = self._get_answer_prompt() | self.model
+            # PF2-3: capture Ollama prefill vs eval via callback (measured, in-pipeline)
+            _pf23_handler = _OllamaStatsHandler()
             for chunk in _live_chain.stream({
                 "data":     context,
                 "question": standalone_query,
                 "history":  prompt_history,
-            }):
+            }, config={"callbacks": [_pf23_handler]}):
                 full_response += chunk
+                if on_chunk:
+                    try:
+                        on_chunk(full_response)
+                    except Exception:
+                        pass
 
+            _mark("generation_done")
+            # PF2-3: log Ollama breakdown alongside wall-clock; fallback if not exposed
+            try:
+                gi = _pf23_handler.generation_info
+                if gi:
+                    prefill = gi.get("prompt_eval_duration", 0) / 1e9
+                    eval_dur = gi.get("eval_duration", 0) / 1e9
+                    total_ollama = gi.get("total_duration", 0) / 1e9
+                    wall = _t["generation_done"] - _t["rerank_done"]
+                    residual = wall - total_ollama
+                    print(f"[GENERATION_SPLIT] prefill={prefill:.3f}s eval={eval_dur:.3f}s ollama_total={total_ollama:.3f}s wall={wall:.3f}s residual={residual:.3f}s toks prompt {gi.get('prompt_eval_count')} eval {gi.get('eval_count')}")
+                    trace["generation_split"] = {"prefill": prefill, "eval": eval_dur, "ollama_total": total_ollama, "wall": wall}
+                else:
+                    try:
+                        import requests as _rq
+                        filled = self._get_answer_prompt().format(data=context, question=standalone_query, history=prompt_history)
+                        _r = _rq.post("http://localhost:11434/api/generate", json={"model": LLM_MODEL, "prompt": filled, "stream": False, "options": {"num_predict": 400}}, timeout=30)
+                        if _r.status_code == 200:
+                            _j = _r.json()
+                            prefill = _j.get("prompt_eval_duration",0)/1e9
+                            eval_dur = _j.get("eval_duration",0)/1e9
+                            print(f"[GENERATION_SPLIT fallback] prefill={prefill:.3f}s eval={eval_dur:.3f}s")
+                    except Exception as _e:
+                        print(f"[GENERATION_SPLIT fallback error] {_e}")
+            except Exception as _pf23_e:
+                print(f"[GENERATION_SPLIT error] {_pf23_e}")
             # T2 backup: strip forbidden data-narration openers
             full_response = self._strip_data_narration(full_response)
+            # P4-5: degraded mode disclaimer
+            if degraded_mode:
+                full_response += "\n\n*Catatan: pengambilan data sedang terganggu, jawaban mungkin kurang akurat.*"
+                print("⚠️  Degraded mode: BM25-only (Chroma unavailable)")
+
+            # I1: stage breakdown print
+            try:
+                stages = {
+                    "scope":      _t["scope_done"] - _t["start"],
+                    "rewrite":    _t["rewrite_done"] - _t["scope_done"],
+                    "plant":      _t["plant_done"] - _t["rewrite_done"],
+                    "retrieval":  _t["retrieval_done"] - _t["plant_done"],
+                    "rerank":     _t["rerank_done"] - _t["retrieval_done"],
+                    "generation": _t["generation_done"] - _t["rerank_done"],
+                }
+                total = _t["generation_done"] - _t["start"]
+                print(f"[STAGE_TIMING] {stages} total={total:.2f}s")
+            except Exception:
+                pass
 
             print(full_response)
             trace["answer_preview"] = full_response[:200]
@@ -652,14 +847,26 @@ class SugiCore:
 
         except Exception as e:
             error_msg     = str(e)
-            full_response = self._strip_data_narration(f"⚠️ Maaf, terjadi kesalahan: {e}")
+            # PF-F1: timeout fires mid-stream — preserve partial text already shown via on_chunk
+            is_timeout = "timeout" in error_msg.lower() or "timed out" in error_msg.lower()
+            if is_timeout and full_response.strip():
+                full_response = self._strip_data_narration(full_response.strip() + " ⚠️ [respons terhenti karena timeout]")
+                if on_chunk:
+                    try:
+                        on_chunk(full_response)
+                    except Exception:
+                        pass
+            else:
+                full_response = self._strip_data_narration(f"⚠️ Maaf, terjadi kesalahan: {e}")
             print(f"\n❌  SugiCore error for {user_id}: {e}")
             # Jalur error: commit sinkron — tidak ada full_response yang
             # ditunggu, logging tetap harus langsung tercatat.
             commit_trace(trace, error=error_msg)
+            _busy_unmark(_busy_path)
 
         # D1: ukur latency ask() (tanpa eval). See docs/decisions.md#d1
         print(f"[TIMING] ask() returning after {time.monotonic() - _local_start:.2f}s")
+        _busy_unmark(_busy_path)
         return full_response
 
     def _run_eval_and_commit(

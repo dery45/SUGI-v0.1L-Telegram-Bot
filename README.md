@@ -64,19 +64,39 @@ Here is SUGI AI in action on Telegram:
 - **INI-based Configuration** → All keywords & plant maps in `config/settings/`, no code changes needed.
 - **Scope Guard** → Only answers agriculture & plantation related topics.  
 - **Offline Message Catch-up** → Telegram bot processes messages sent while offline on restart, with crash-safe offset persistence.
+- **Backpressure & Input Guard (T1-1/T1-2)** → `MAX_CONCURRENT_ASK=2` semaphore with `wait_for(0.01)` fast-fail `⏳ Sedang banyak pertanyaan...` (no queue buildup to `71s` p95); `MAX_QUESTION_CHARS=2000` early return `Maaf, pertanyaan terlalu panjang...` in `<1ms` vs prior `120s` Ollama timeout.
+- **UserStore Atomic Locking (T1-3)** → `threading.Lock` + `tmp→os.replace` atomic write — no `visit_count` loss under concurrent Telegram messages (validated `20` threads → `21/21`).
+- **GPU Acceleration (G1)** → RX 6600 8GB Vulkan, Ollama `0.33.3` `100% VRAM` (`sugi 2.54GB + qwen 1.16GB + mxbai 0.61GB =4.31GB` primary) — corrects prior `CPU-only` inference; modest `15.2s` median vs `18.9s` CPU-era.
+- **Dual-Ollama Isolation (P2-2/G2)** → `OLLAMA_HOST_INSIGHT=http://127.0.0.1:11435` + `start_all.py` second `ollama serve` (qwen `1.1GB`, `keep_alive 60s` G2) — background `~600s/day` qwen insight no longer queues on user path; `5.4-5.6GB` of `8GB` VRAM headroom (corrected from `8.6GB`).
+- **Observability (P2-3)** → `queries.jsonl` now carries `model_name`/`prompt_version` (`PROMPT_VERSION=v1`), `print_debug_report` shows `avg/p50/p95` + `Models/Prompts`, `!stats` shows live `In-flight: 0/2`.
+- **Telegram Streaming (P2-4)** → `SugiCore.ask(on_chunk)` streams `full_response` per `_live_chain.stream()` chunk → `run_coroutine_threadsafe(edit_text, 200 chars / 1s)` — perceived TTFT `0.07s` visible, final `edit_text` handles OOS/length-guard paths.
+- **Stage Timing (I1)** → `ask()` emits `[STAGE_TIMING] {scope, rewrite, plant, retrieval, rerank, generation} total` + `ThreadingHTTPServer backlog 50` (V1b) — explains `20-30s` tail (`generation 5-19s` dominant, `plant 0.03-5.0s`, `retrieval 0.6-3.9s`).
+- **Generation Tuning (P3-1)** → `num_predict 512→400` on `sugi-v0.1L` (rarely near `400` tokens `chars/4`); `V1b 10/10` wall `45-50s` not hard wall, `V2b OLLAMA_NUM_PARALLEL=2` tested negative (compute-bound, `121s` vs `27s` worse).
+- **Embedding Pooling Fix (PF-V1)** → `Session` reuse 2.06s→0.031s **measured** (was `requests.get` per call); `OllamaEmbeddings` 0.03s now ground truth, retrieval 0.60-3.48s lean.
+- **Perenual Pooling+Parallel (PF2-1)** → `requests.Session` + `species‖disease` parallel `ThreadPoolExecutor(2)` — 2.795s→1.528s **measured** (1.20s pooling +0.06s parallel), `Session` safe concurrent (fallback `threading.local`).
+- **Outlier Busy Signal (Part0)** → `data/busy/*.flag` per-request inter-process signal, insight `wait_if_busy` 60s defer (stale 300s auto-clean) — outliers 8→0 since, recent p95 35.75s (was 94.21s), 5 concurrent+insight p95 49.81s well below 94-365s **measured**.
+- **Duplicate Fix (Part1)** → `query_id` 12 hex + idempotent `commit_trace` double-commit suppressed — dups 20→0, huge ≥600s 0 since **measured**.
+- **Generation Split (PF2-3)** → `GENERATION_SPLIT` prefill 40-73% (e.g. 7.1/2.5s, 0.02/5.6s) residual <0.03s **measured** via `BaseCallbackHandler` `on_llm_end`, justifies cap 6.
+- **Prompt Trim (Part4)** → `all_docs` cap 8→6 (3680 vs 3714 -1% **measured**, 0/25 flagged both) — saves prefill, no regression.
+- **HTTP Streaming Endpoint (PF2-2)** → `POST /ask/stream` NDJSON `{"chunk":...}` + `{"done":true,"final":...}` — TTFT 1.0-1.3s warm **measured** (22.59s cold 15s prefill vs 0.02s warm), buffered still 6-12s.
+- **Reranker Background (P4-4 QW-3)** → `HuggingFaceCrossEncoder` 4.19s overlapped background (`threading.Event` 10s fallback to no-rerank) — init not serial.
+- **Warm-up (P4-4 QW-5)** → `model.invoke("Halo")` background after `SugiCore ready` — first real after warm-up 21s cold vs 2-3s warm race, `🔥 Warm-up done`.
+- **Chroma Fallback (P4-5)** → BM25-only degraded mode on `Chroma` `embed`/`retrieval` failure + `*Catatan: pengambilan data sedang terganggu*` disclaimer — query survives vs fails outright.
 
 ## Tech Stack
 
 | Component | Detail |
 |---|---|
-| **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama) |
-| **Utility Model** | `qwen2.5:1.5b` — query rewriting fallback, plant extraction, eval loop, insights |
-| **Embedding** | `mxbai-embed-large` (Ollama) |
-| **Vector Store** | ChromaDB Server mode — 6 collections |
-| **Retriever** | Ensemble (BM25 + Vector) + Cross-Encoder reranker (`ms-marco-MiniLM-L-6-v2`, top_n=8) — **single pass over RAG ± weather (M1 + A11)**; memory retrieved separately & user-scoped, gated by `needs_ref_context` (A10/A4) |
-| **Insight DB** | MongoDB Atlas — 7 collections across `sugi_insights` + `test` databases (write-only) |
-| **External APIs** | Open-Meteo (Free weather), Perenual (Plants & Pests) |
+| **Primary LLM** | Llama 3.2 personal-tuned → `sugi-v0.1L` (via Ollama 0.33.3, `num_ctx 4096` `num_predict 400` P3-1, `keep_alive 600`, `timeout 180` PF2-V1, `100% VRAM` Vulkan 2.54GB, warm-up `invoke("Halo")` QW-5) |
+| **Utility Model** | `qwen2.5:1.5b` — query rewriting (`num_predict 40`, `keep_alive 600`→`60s` G2, `base_url` 11435 H2a), plant extraction (`num_predict 10`), eval (`timeout 15`), insights (`timeout 240s`, `OLLAMA_HOST_INSIGHT` 11435) |
+| **Embedding** | `mxbai-embed-large` 0.61GB VRAM, **0.031s pooled Session** (was 2.06s bare `requests.get`) **measured** PF-V1 (`OllamaEmbeddings` 0.03s) |
+| **Vector Store** | ChromaDB Server `/api/v2/heartbeat` — 6 collections (`main_dataset` 368k, `langchain` 77k), `ThreadingHTTPServer` backlog 50 (V1b), BM25 fallback on Chroma fail P4-5 |
+| **Retriever** | Ensemble (BM25 k=4 + Vector k=4) + Cross-Encoder `ms-marco-MiniLM-L-6-v2` top_n=8 background QW-3 (4.19s overlapped) — single pass (M1+A11); memory user-scoped `needs_ref_context` (A10/A4); `retrieval 0.60-3.48s` + `rerank 0.15-0.50s` (cap 6 Part4) |
+| **Insight DB** | MongoDB Atlas 7 collections across `sugi_insights`+`test` (write-only), `keep_alive 60s` insight, `wait_if_busy` 60s defer Part0 (stale 300s) |
+| **External APIs** | Open-Meteo (Free), Perenual `Session` pooled 1.59s vs 2.79s + `species‖disease` parallel **measured** PF2-1, `429` trip 1h 0.003s, negative cache 24h 0.001s **measured** |
 | **Framework** | LangChain, LangChain-Classic |
+| **Observability** | `PROMPT_VERSION=v1`, `model_name`/`prompt_version`/`query_id` 12 hex `p50/p95` `In-flight 0/2` + `[STAGE_TIMING]` 6 stages + `[GENERATION_SPLIT]` prefill/eval residual <0.03s **measured** (PF2-3), `data/busy/*.flag` Part0, degraded disclaimer P4-5 |
+| **Orchestration** | `start_all.py` 8 services (Insight Ollama 11435) + `ThreadingHTTPServer` backlog 50 + `Semaphore(2)` T1-1 + `run_coroutine_threadsafe` streaming `POST /ask/stream` NDJSON PF2-2 TTFT 1.0s warm |
 
 ---
 
@@ -149,6 +169,9 @@ Data consumed by external dashboards — zero reads from chatbot application.
 | `STARTUP_GRACE_SECONDS` | No | `180` | Fallback grace for all services (A8) |
 | `INSIGHT_LLM_DELAY` | No | `1` | Seconds between insight LLM calls (A8/A12); `0` = off |
 | `DAILY_INSIGHT_MAX_WORKERS` | No | `1` | Daily insight LLM workers (A12): `1` = sequential + pacing; `>1` = bounded thread pool |
+| `MAX_CONCURRENT_ASK` | No | `2` | Backpressure semaphore `asyncio.Semaphore(2)` + `wait_for 0.01` fast-fail busy `⏳` (T1-1) |
+| `MAX_QUESTION_CHARS` | No | `2000` | Input length guard early return `<1ms` vs `120s` timeout (T1-2) |
+| `OLLAMA_HOST_INSIGHT` | No | `http://127.0.0.1:11435` | Insight `qwen` Ollama host (P2-2) — fallback `11434` if unset; `keep_alive 60s` G2 |
 
 ### `config/settings/scope_config.ini` — Domain Guard
 
@@ -179,76 +202,75 @@ User Question
     │
     ▼
 ┌─────────────────────────────────────────────┐
-│ [1] SCOPE GUARD                              │
-│   ├── Greeting check → bypass scope          │
-│   ├── Blocked keywords → REFUSAL             │
-│   ├── Allowed keywords → continue            │
+│ [0] INPUT GUARDS + BUSY SIGNAL               │
+│   ├── MAX_QUESTION_CHARS 2000 → early return │  T1-2 (<1ms)
+│   ├── MAX_CONCURRENT_ASK 2 → busy 0.01s     │  T1-1 Telegram semaphore
+│   └── Touch data/busy/<user>_<ns>.flag      │  Part0 (insight wait_if_busy 60s)
+└───────────────────┬─────────────────────────┘
+                    ▼
+┌─────────────────────────────────────────────┐
+│ [1] SCOPE GUARD                              │  scope 0.00-0.02s
+│   ├── Greeting → bypass                      │
+│   ├── Blocked → REFUSAL (27ms)              │  R2 (blocked overrides allowed)
+│   ├── Allowed → continue                     │
 │   └── No match → REFUSAL                     │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [2] QUERY REWRITING (3-layer)                │
-│   ├── Layer 1: Definitional? ("apa itu X")   │
-│   │   └── Yes → skip rewrite, return original│
-│   ├── Layer 2: Has referential word?         │
-│   │   ├── No → skip rewrite                  │
-│   │   └── Yes → Rule-based rewrite (0ms)     │
-│   │       ├── Suffix-based ("menanamnya")    │
-│   │       └── Word-replace ("itu")           │
-│   └── Layer 3: Ambiguous? → Qwen2.5 LLM     │
-│       └── Timeout/fail → use original query  │
-│                                              │
-│   Scope re-check: suffix rewrites can bypass │
-│   scope; word-replace rewrites CANNOT        │
+│ [2] QUERY REWRITING (3-layer)                │  rewrite 0.000004-0.04s
+│   ├── Definitional? ("apa itu X") → skip     │
+│   ├── Has referential? → rule 0ms (11435)   │  H2a
+│   └── Ambiguous? → Qwen 11435 2.27s (30s)   │
+│   Scope re-check: suffix can bypass, word cannot │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [3] PLANT & WEATHER DETECTION                │
-│   ├── Plant: strong keyword? → plant API     │
-│   │   ├── weak + strong? → plant API         │
-│   │   ├── weak only? → skip plant API        │
-│   │   └── Plant name extraction → Perenual   │
-│   └── Weather: keyword match? → weather docs │
+│ [3] PLANT & WEATHER DETECTION                │  plant 0.008-2.16s
+│   ├── Plant: strong? → plant API            │  Session pooled PF2-1 1.59s vs 2.79s
+│   │   ├── weak+strong? → plant API          │  negative cache 24h 0.001s PF-F2
+│   │   ├── weak only? → skip                 │
+│   │   └── Qwen 11435 10 tok → Perenual      │  parallel species‖disease PF2-1
+│   └── Weather → weather docs (k=8)         │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [4] HYBRID RETRIEVAL                         │
-│   ├── BM25 Retriever (k=4)                   │
-│   ├── Vector Retriever (k=4)                 │
-│   ├── Plant Retriever (k=3, if plant query)  │
-│   └── Memory Search (k=2, if referential)    │
-│                                              │
-│   Ensemble weights: base 0.60, plant 0.15    │
-│   (memory is searched separately & gated by  │
-│    needs_ref_context — A10/A4)               │
+│ [4] HYBRID RETRIEVAL (BM25 fallback)         │  retrieval 0.60-3.48s (embed 0.031s pooled)
+│   ├── BM25 k=4 (always)                      │  PF-V1 Session
+│   ├── Vector k=4 (pooled 0.031s)            │  Chroma /api/v2, fallback BM25-only P4-5
+│   ├── Plant k=3 (if plant)                  │
+│   └── Memory k=2 (if referential)           │  needs_ref_context A10
+│   Ensemble 0.60/0.15, backlog 50 V1b, cap 6 Part4 │
+│   [STAGE_TIMING] + [GENERATION_SPLIT]       │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [5] CROSS-ENCODER RERANKER                   │
-│   └── ms-marco-MiniLM-L-6-v2, top_n=8       │
-│   └── single pass over RAG ± weather (A11)  │
+│ [5] CROSS-ENCODER RERANKER (background)      │  rerank 0.15-0.50s (warm 0.055s)
+│   └── ms-marco-MiniLM-L-6-v2 top_n=8        │  QW-3 4.19s background load, wait 10s
+│   └── single pass (A11) over RAG±weather    │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [6] LLM GENERATION                           │
-│   ├── Answer template with date/time/context │
-│   ├── 8000-char input truncation             │
-│   ├── 4096 token context window              │
-│   └── Streaming output                       │
+│ [6] LLM GENERATION (prefill/eval split)      │  generation 6.3-13.0s (48-85%)
+│   ├── Template v1 + date/time + 6 chunks    │  Part4 3680 vs 3714 -1% prefill 40-73%
+│   ├── 4096 ctx, timeout 180 PF2-V1, 400 tok  │  residual <0.03s PF2-3
+│   ├── on_chunk → edit_text 200c/1s P2-4     │  streaming
+│   └── /ask/stream NDJSON PF2-2 TTFT 1.0s warm│  (22.59s cold 15s prefill vs 0.02s warm)
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [7] EVAL LOOP                                │
-│   ├── Lexical faithfulness check (fast)      │
-│   ├── Lexical relevance check (fast)         │
-│   └── Qwen2.5 LLM eval (if inconclusive)     │
+│ [7] EVAL LOOP (background daemon)            │
+│   ├── Lexical 0.50/0.25 S1 (Sastrawi stem)   │
+│   └── Qwen2.5 LLM if inconclusive (15s)     │
 └───────────────────┬─────────────────────────┘
                     ▼
 ┌─────────────────────────────────────────────┐
-│ [8] PERSISTENCE                              │
-│   ├── Append log to queries.jsonl            │
-│   ├── Flagged? → Append to eval_flags.jsonl  │
-│   └── Every 5 turns → save session memory    │
+│ [8] PERSISTENCE + OBSERVABILITY              │
+│   ├── queries.jsonl 12 hex, idempotent      │  Part1 dups 20→0
+│   ├── model_name/prompt_version/generation_split │ PF2-3
+│   ├── busy flags + degraded disclaimer      │  Part0/P4-5
+│   ├── Every 5 turns → session memory        │
+│   ├── !debug p50/p95 13.02/35.75s          │  2026-09-09 recent
+│   └── !stats In-flight 0/2 + !offset       │
 └─────────────────────────────────────────────┘
 ```
 
@@ -500,10 +522,12 @@ Evaluated on:
 
 > Full details live in: [`docs/CHANGELOG.md`](docs/CHANGELOG.md) (detailed chronological changelog — the **only** tracked file in `docs/`; the rest is internal-only) and [`docs/VERSIONS.md`](docs/VERSIONS.md) (concise overview, git-ignored).
 
-**Current status:** v0.2.3 (uncommitted working tree; committed HEAD v0.2.0 — `3d5cdff`, 2026-08-12)
+**Current status:** v0.4.0 (working tree; HEAD `3d5cdff` v0.2.0, 2026-08-12) — Phase 2-4 complete, outlier fix verified, prompt trim, Chroma fallback, combined load validated (see decisions.md Phase 3-4 + `PHASE1_REVIEW_RERUN_20260907.md` 2026-09-09 17/17 PASS 262.92s)
 
 | Version | Date | Status | Summary |
 |---|---|---|---|
+| **v0.4.0** | 2026-09-09 | ⏳ Working tree (Phase 2-4 + P4-1-6) | **Outlier fix verified:** 0/12 genuine >90s since Part0 vs 8/493=1.62% before **measured**, dups 20→0, recent p95 35.75s (was 94.21s); **PF-V1** embedding `Session` pooling 2.06s→0.031s **measured**; **PF2-V1** timeout 90→180 reconciled vs history p95 51s max 140s; **PF2-1** Perenual `Session` + `species‖disease` parallel 2.795s→1.528s (pooling 1.20s + parallel 0.06s) **measured**, negative cache 24h 0.001s; **PF2-2** `POST /ask/stream` NDJSON TTFT 1.0-1.3s warm **measured** (22.59s cold→1.01s warm); **PF2-3** `GENERATION_SPLIT` prefill 40-73% (0.02-7.1s) residual <0.03s **measured**; **Part0** busy flag `data/busy/*.flag` + `wait_if_busy` 60s defer **measured** 4s; **Part1** `query_id` 12 hex + idempotent `commit_trace`; **Part4** cap 8→6 (3680 vs 3714 -1% **measured**, 0/25 flagged); **P4-4** QW-3 background reranker 4.19s overlapped + QW-5 `invoke("Halo")` warm-up; **P4-5** Chroma fallback BM25-only + disclaimer; **P4-6** 5 concurrent+insight p95 49.81s **measured** well below 94-365s — busy holds |
+| **v0.3.0** | 2026-09-07 | ⏳ Working tree (Phase 1-5) | **Scalability remediation complete:** T1-1 backpressure `MAX_CONCURRENT_ASK=2` (0.607s `2 ok 3 busy`), T1-2 input guard `2000` (`<1ms` vs `120s`), T1-3 `UserStore` lock+atomic; V1b `backlog 50` corrects `10/10` wall `45-50s` not hard wall; V2b `OLLAMA_NUM_PARALLEL=2` negative `121s` vs `27s` (compute-bound, keep `1`); P2-2 dual Ollama `11435` (`1.1GB` qwen `keep_alive 60s` G2, `5.4-5.6GB` VRAM headroom corrected); P2-3 observability `model_name`/`prompt_version` `p50/p95` `In-flight`; P2-4 streaming `on_chunk 200c/1s`; G1 GPU `100% VRAM` Vulkan RX 6600 (`15.2s` median); H1 prefill `0.2-7.1s` vs generation `5.9s` mixed; H2a utility redirect to `11435` (ambiguous), H2b embed `0.04s` not worth; P3-1 `num_predict 400`; I1 `STAGE_TIMING` 6 stages explains `20-30s` tail (`generation 48-85%`); Final disposition: **do not build** sharding/Redis/K8s — 3 triggers gated |
 | **v0.2.3** | 2026-08-24 | ⏳ Working tree (T1–T2) | T1 whitespace normalization at `ask()` entry (fixes "hari  ini" double-space → false referential → Qwen timeout → memory injection); T2 data-narration removal: prompt hardening (silent gap-fill, silent history, forbidden-opener list, anti-refusal backstop) + runtime post-filter `_strip_data_narration()` strips "Saya tidak menemukan informasi", "Berdasarkan riwayat...", anti-refusal backstop |
 | **v0.2.2** | 2026-08-18 | ⏳ Working tree (N1, S1, S2) | N1 province metadata hoist for price insights (hoist `province` to chunk metadata + schema-versioned R4 reindex), S1 stemmed lexical eval overlap (Sastrawi `_stem_tokens`, graceful fallback, thresholds 0.50/0.25, thread lock), S2 scalability roadmap decision recorded (Option B: descoped Redis sessions + second Ollama at current scale) |
 | **v0.2.1** | 2026-08-12 | ⏳ Working tree (R1–R4 + Q1–Q2) | R1 fail-closed debug access (`DEBUG_ALLOWED_USERS` deny-by-default + startup warning), R2 `blocked_kw` enforced (blocked overrides allowed), R3 global Telegram error handler (fallback reply instead of silence), R4 content-hash re-index dedup (CSV/XLSX/PDF `file_hash`, delete+reindex on change) + BM25 invalidation backfill for PDFs, Q1 tag comments consolidated into `docs/decisions.md`, Q2 duplicated insight helpers extracted into shared `services/insight_common.py` (per-service k/label/truncation preserved) |
@@ -526,4 +550,4 @@ Evaluated on:
 ## License
 MIT License.
 
-Last updated: August 2026 · v0.1L (Scope-Hardened) · Changelog v0.2.3 · RAG Score 94/100
+Last updated: 2026-09-09 · v0.4.0 (Outlier fix verified + busy signal + pooling/parallel + streaming TTFT + generation split + cap 6 + fallback) · `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 262.92s · RAG Score 94/100

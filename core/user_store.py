@@ -16,6 +16,7 @@ Data yang disimpan per user:
 
 import json
 import os
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,7 @@ class UserStore:
     def __init__(self, path: Path = USER_DB_PATH):
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
         self._data: dict = self._load()
 
     def _load(self) -> dict:
@@ -40,10 +42,13 @@ class UserStore:
         return {}
 
     def _save(self):
-        self.path.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        # Atomic write: temp file + os.replace to avoid corruption on crash
+        # and to serialize with _lock callers.
+        tmp_path = self.path.with_suffix(".tmp")
+        tmp_path.write_text(
+            json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8"
         )
+        tmp_path.replace(self.path)
 
     def get_or_create(
         self,
@@ -56,54 +61,58 @@ class UserStore:
         Ambil data user jika ada, buat baru jika belum ada.
         Update visit_count dan last_seen setiap kali dipanggil.
         """
-        now = datetime.now().isoformat()
+        with self._lock:
+            now = datetime.now().isoformat()
 
-        if user_id not in self._data:
-            self._data[user_id] = {
-                "user_id":      user_id,
-                "platform":     platform,
-                "username":     username,
-                "full_name":    full_name,
-                "phone_number": None,
-                "first_seen":   now,
-                "last_seen":    now,
-                "visit_count":  1,
-                "session_ids":  [],
-            }
-            print(f"👤 New user registered: {user_id} ({platform})")
-        else:
-            self._data[user_id]["visit_count"] += 1
-            self._data[user_id]["last_seen"]    = now
-            # Update username/nama jika berubah
-            if username:
-                self._data[user_id]["username"]   = username
-            if full_name:
-                self._data[user_id]["full_name"]  = full_name
+            if user_id not in self._data:
+                self._data[user_id] = {
+                    "user_id":      user_id,
+                    "platform":     platform,
+                    "username":     username,
+                    "full_name":    full_name,
+                    "phone_number": None,
+                    "first_seen":   now,
+                    "last_seen":    now,
+                    "visit_count":  1,
+                    "session_ids":  [],
+                }
+                print(f"👤 New user registered: {user_id} ({platform})")
+            else:
+                self._data[user_id]["visit_count"] += 1
+                self._data[user_id]["last_seen"]    = now
+                # Update username/nama jika berubah
+                if username:
+                    self._data[user_id]["username"]   = username
+                if full_name:
+                    self._data[user_id]["full_name"]  = full_name
 
-        self._save()
-        return self._data[user_id]
+            self._save()
+            return self._data[user_id]
 
     def update_phone(self, user_id: str, phone: str):
         """Simpan nomor HP user."""
-        if user_id in self._data:
-            self._data[user_id]["phone_number"] = phone
-            self._save()
-            print(f"📱 Phone updated for {user_id}: {phone}")
+        with self._lock:
+            if user_id in self._data:
+                self._data[user_id]["phone_number"] = phone
+                self._save()
+                print(f"📱 Phone updated for {user_id}: {phone}")
 
     def update_last_seen(self, user_id: str):
-        if user_id in self._data:
-            self._data[user_id]["last_seen"] = datetime.now().isoformat()
-            self._save()
+        with self._lock:
+            if user_id in self._data:
+                self._data[user_id]["last_seen"] = datetime.now().isoformat()
+                self._save()
 
     def add_session(self, user_id: str, session_id: str):
         """Tambahkan session_id ke riwayat user."""
-        if user_id in self._data:
-            sessions = self._data[user_id].setdefault("session_ids", [])
-            if session_id not in sessions:
-                sessions.append(session_id)
-                # Simpan hanya 50 session terakhir
-                self._data[user_id]["session_ids"] = sessions[-50:]
-                self._save()
+        with self._lock:
+            if user_id in self._data:
+                sessions = self._data[user_id].setdefault("session_ids", [])
+                if session_id not in sessions:
+                    sessions.append(session_id)
+                    # Simpan hanya 50 session terakhir
+                    self._data[user_id]["session_ids"] = sessions[-50:]
+                    self._save()
 
     def get(self, user_id: str) -> Optional[dict]:
         return self._data.get(user_id)

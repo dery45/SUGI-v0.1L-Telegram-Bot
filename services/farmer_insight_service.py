@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 if Path(__file__).resolve().parent.parent not in map(Path, sys.path):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.insight_common import build_insight_llm, get_plant_context, get_rag_context, get_weather_context, ping_with_retry
+from services.insight_common import build_insight_llm, get_plant_context, get_rag_context, get_weather_context, ping_with_retry, wait_if_busy
 
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
@@ -250,26 +250,37 @@ class FarmerInsightEngine:
         print("  FarmerInsight: Initializing...")
 
         # ── MongoDB ──
+        # Hormati tls=false di URI (self-hosted tanpa TLS seperti
+        # sugiecosystem.cloud) — jangan paksa tls=True kalau URI minta false.
+        _use_tls = "tls=false" not in MONGO_URI.lower() and "ssl=false" not in MONGO_URI.lower()
+        _tls_kwargs = dict(tls=True, tlsCAFile=certifi.where(), tlsAllowInvalidCertificates=False) if _use_tls else {}
         self._mongo = MongoClient(
             MONGO_URI,
             serverSelectionTimeoutMS=15_000,
             socketTimeoutMS=30_000,
             connectTimeoutMS=20_000,
-            tls=True,
-            tlsCAFile=certifi.where(),
-            tlsAllowInvalidCertificates=False,
             retryWrites=True,
+            **_tls_kwargs,
         )
         ping_with_retry(self._mongo, label="FarmerInsight")
         self._source_db = self._mongo["test"]
         self._target_sugi = self._mongo["sugi_insights"]
         self._target_test = self._mongo["test"]
 
-        # Ensure indexes
-        self._target_sugi["farmerinsights"].create_index("insightKey", unique=True, background=True)
-        self._target_test["farmerinsights"].create_index("insightKey", unique=True, background=True)
-        self._target_sugi["governmentinsights"].create_index("sourceCollection", unique=True, background=True)
-        self._target_test["governmentinsights"].create_index("sourceCollection", unique=True, background=True)
+        # Ensure indexes — best-effort; don't crash if user lacks dbAdmin on sugi_insights/test
+        # (e.g. sugi_user only authorized on sugidash → createIndex -> code 13 Unauthorized)
+        for _col in [
+            (self._target_sugi["farmerinsights"], "sugi_insights.farmerinsights:insightKey"),
+            (self._target_test["farmerinsights"], "test.farmerinsights:insightKey"),
+            (self._target_sugi["governmentinsights"], "sugi_insights.governmentinsights:sourceCollection"),
+            (self._target_test["governmentinsights"], "test.governmentinsights:sourceCollection"),
+        ]:
+            col, label = _col
+            try:
+                col.create_index("insightKey" if "farmerinsights" in label else "sourceCollection", unique=True, background=True)
+            except Exception as e:
+                # Unauthorized (code 13) or other index error — log and continue
+                print(f"  FarmerInsight: skip index {label}: {e.__class__.__name__}: {e}")
         print("  FarmerInsight: MongoDB ready, indexes ensured.")
 
         # ── LLM ──
@@ -1115,6 +1126,7 @@ class FarmerInsightEngine:
     def run_all(self):
         print("\n  ── Generating all farmer insights (10) ──")
         for i, defn in enumerate(FARMER_INSIGHT_DEFS):
+            wait_if_busy("farmer", max_wait=60)
             try:
                 result = self._generate_farmer_insight(defn)
                 if result:
