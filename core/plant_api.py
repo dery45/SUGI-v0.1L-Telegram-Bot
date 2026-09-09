@@ -88,6 +88,26 @@ def _trip_rate_limit() -> bool:
         return True
 
 
+# ─── Negative cache for Perenual misses (PF-F2) ──────────────────────────────
+# In-memory memoization for plant names that returned empty from Perenual.
+# Shorter TTL (24h) than positive cache (30d) since data may appear later.
+# See decisions.md#pf-f2
+_NEGATIVE_CACHE_TTL_HOURS = 24
+_negative_cache: dict[str, float] = {}
+_negative_cache_lock = threading.Lock()
+
+
+def _is_known_empty(plant_name: str) -> bool:
+    with _negative_cache_lock:
+        ts = _negative_cache.get(plant_name.lower().strip())
+    return ts is not None and (time.time() - ts) < _NEGATIVE_CACHE_TTL_HOURS * 3600
+
+
+def _mark_empty(plant_name: str) -> None:
+    with _negative_cache_lock:
+        _negative_cache[plant_name.lower().strip()] = time.time()
+
+
 # ─── API Key Validation on Startup ────────────────────────────────────────────
 if PERENUAL_KEY and PERENUAL_KEY != "sk-your-api-key-here":
     try:
@@ -134,6 +154,10 @@ class _ApiQueue:
 
 _queue = _ApiQueue(min_interval=1.1)
 
+# PF2-1: pooled Session for Perenual (PF-V1 finding: bare requests.get pays ~2s connection tax each call)
+# Reused Session pays it once; _ApiQueue remains sole rate-limiter
+_session = requests.Session()
+
 
 # ─── HTTP helper dengan flat retry ───────────────────────────────────────────
 _MAX_RETRIES  = 0      # max 0 retry (1 attempt total) — gagal cepat
@@ -159,7 +183,7 @@ def _get(url: str, params: dict, trip_on_429: bool = True) -> Optional[dict]:
         _queue.wait()   # rate limit: tunggu giliran
 
         try:
-            resp = requests.get(url, params=params, timeout=8)
+            resp = _session.get(url, params=params, timeout=8)
 
             # 429 → flat retry
             if resp.status_code == 429:
@@ -303,6 +327,10 @@ def _species_to_text(detail: dict) -> str:
 
 
 def fetch_plant_species(plant_name: str) -> list[Document]:
+    # PF-F2: fast-fail on known empty within 24h window
+    if _is_known_empty(plant_name):
+        print(f"   ⏭️  Plant '{plant_name}' known empty (negative cache) — skipping Perenual.")
+        return []
     cache_key = f"species:{plant_name.lower().strip()}"
     if _already_cached(cache_key):
         print(f"   ✅ Plant '{plant_name}' found in local cache.")
@@ -318,6 +346,7 @@ def fetch_plant_species(plant_name: str) -> list[Document]:
     species_list = _fetch_species_list(plant_name)
     if not species_list:
         print(f"   ℹ️  No species results found for '{plant_name}'.")
+        _mark_empty(plant_name)
         return []
 
     candidate_ids = [item.get("id") for item in species_list[:5] if item.get("id")]
@@ -382,6 +411,10 @@ def _disease_to_text(item: dict) -> str:
 
 
 def fetch_pest_disease(query: str) -> list[Document]:
+    # PF-F2: fast-fail on known empty within 24h window
+    if _is_known_empty(query):
+        print(f"   ⏭️  Disease '{query}' known empty (negative cache) — skipping Perenual.")
+        return []
     cache_key = f"disease:{query.lower().strip()}"
     if _already_cached(cache_key):
         print(f"   ✅ Disease '{query}' found in local cache.")
@@ -398,9 +431,13 @@ def fetch_pest_disease(query: str) -> list[Document]:
         "q": query, "page": 1, "key": PERENUAL_KEY
     })
     if not data:
+        _mark_empty(query)
         return []
 
     items     = data.get("data", [])
+    if not items:
+        _mark_empty(query)
+        return []
     documents = []
     for item in items[:5]:
         text   = _disease_to_text(item)
@@ -494,12 +531,16 @@ def search_plant_info(plant_name: str) -> list[Document]:
         print("   ⚠️  PERENUAL_API_KEY not configured — skipping API fetch.")
         return []
 
+    # PF2-1: species and disease are independent (both keyed by plant_name), so run in parallel.
+    # Only care_guides depends on species_id. PF-F2 negative cache still short-circuits before any _get.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        species_future = pool.submit(fetch_plant_species, plant_name)
+        disease_future = pool.submit(fetch_pest_disease, plant_name)
+        species_docs = species_future.result()
+        disease_docs = disease_future.result()
+
     all_docs: list[Document] = []
-
-    species_docs = fetch_plant_species(plant_name)
     all_docs.extend(species_docs)
-
-    disease_docs = fetch_pest_disease(plant_name)
     all_docs.extend(disease_docs)
 
     if species_docs:

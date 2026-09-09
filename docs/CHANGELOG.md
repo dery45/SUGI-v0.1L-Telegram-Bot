@@ -19,6 +19,41 @@ Legend for source of each entry:
 
 ---
 
+## `v0.4.0` — 2026-09-09 — Outlier fix verified + busy signal + pooling/parallel + streaming TTFT + generation split + cap 6 + Chroma fallback + combined load (Phase 2 PF-V1/PF-F1/PF-F2 + PF2-V1/PF2-1/PF2-2/PF2-3/PF2-4 + Part0-4 + P4-1/P4-2/P4-3/P4-4/P4-5/P4-6) + performance retest [inferred]
+
+**Status:** working-tree changes (uncommitted; outlier verification, busy-flag, duplicate fix, doc-cap trim, reranker background, warm-up, Chroma fallback, combined load test, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 262.92s).
+
+### Summary
+Phase 2 shipped 4 wins (embedding pooling, melon correction, timeout 180, negative cache 82% pipeline reduction) and Phase 2 extensions (pooling+parallel, streaming TTFT, generation split 40-73% residual <0.03s) — Phase 3 investigated severe outliers 94-365s (7/8 docs 8 plant False **measured**) and duplicate 20→0, re-verified TTFT cold 15s prefill vs warm 0.02s **measured**, clarified PF2-1 magnitude 1.27s total (pooling 1.20s + parallel 0.06s) **measured**, trimmed cap 8→6 (0/25 flagged) **measured**. Phase 4 confirmed outliers 0/12 vs 8/493=1.62% since Part0 **measured**, hardened busy ceiling to proceed after 60s (not skip) **measured** 6s, re-validated cap 6 matched 0/25, shipped QW-3 background 4.19s + QW-5 warm-up **measured**, Chroma BM25-only fallback + disclaimer **code-derived**, combined 5+insight p95 49.81s **measured** well below 94-365s.
+
+### Detailed changes
+- **PF-V1 embedding fix** — `tests/review/test_ai_performance.py:459` pooled `Session` + warm-up throwaway before `Session.post` to `/api/embed`; raw `requests.get` per call paid 2.06s connection tax (server `total_duration` 0.031s **measured** vs wall 2.06s **measured**), `Session` first 2.10s then 0.031s **measured**, `OllamaEmbeddings` 0.031s **measured** (was 2.06s); STAGE retrieval now 0.60-3.48s **measured** (was 0.63-3.92s).
+- **PF-V2 melon correction** — re-ran `melon` 3× **measured** `Cache hit: 5 docs` plant 0.169s/0.054s/0.034s **measured** (was 5.08s mischaracterized as hit, actually stale fetch), correct record: plant contributes meaningfully when miss, generation still dominates but not dismissible; TTL 27d <30d **measured**.
+- **PF-F1 timeout 90→180** — `core/sugi_core.py:303` `client_kwargs timeout 180` (was None, PF-F1 90, PF2-V1 reconciled vs history p95 51s max recent 140s **measured** 0/12 vs 8/493 **measured**); streaming-safe `except` preserves partial `on_chunk` + `⚠️ [respons terhenti karena timeout]` **code-derived**, semaphore release validated **measured** 4.44s bounded.
+- **PF-F2 negative cache** — `core/plant_api.py:70` `_NEGATIVE_CACHE_TTL_HOURS=24` `_is_known_empty`/`_mark_empty` **code-derived**; `fetch_plant_species`/`fetch_pest_disease` check at top + mark on empty **measured** `chili pepper` 0.921s→0.000s species, 2.677s→0.000s disease, full pipeline `cabai` 20.34s→3.75s **measured** (plant 0.94s→0.057s).
+- **PF2-V1 timeout reconciliation** — pulled `>90s` 28 entries 20 logging artifacts (duplicate `query_id` 9ms vs 3.2M ms **measured**) + 8 genuine 94-365s (7/8 docs 8 plant False **measured**) not dominated by Perenual; raised 90→180 **code-derived** documented in `decisions.md#pf2-v1`.
+- **PF2-1 Perenual pooling+parallel** — `core/plant_api.py:155` `_session=Session` pooled (`Session` safe concurrent, fallback `threading.local`), `core/plant_api.py:522` `species‖disease` `ThreadPoolExecutor(2)` parallel **code-derived**; `xyzabc` miss pooled parallel 1.528s vs unpooled sequential 2.795s **measured** (pooling 1.20s + parallel 0.06s), `melon` hit 0.107s **measured** unaffected.
+- **PF2-2 streaming endpoint** — `tests/review/test_ai_performance.py:188` `POST /ask/stream` NDJSON `{"chunk":...}` + `{"done":true,"final":...}` **code-derived**; TTFT 22.59s cold vs 1.0-1.3s warm **measured** (cold prefill 15s vs warm 0.02s), total 26.17s vs 6.80s, improvement 1.2-5.9s (13-29% perceived) **measured**.
+- **PF2-3 generation split** — `core/sugi_core.py:56` `_OllamaStatsHandler` `on_llm_end` captures `prompt_eval_duration`/`eval_duration` from same streaming call **code-derived** (verified `model.stream` + `chain.stream` both fire **measured**); `GENERATION_SPLIT` prefill 7.119s eval 2.532s wall 9.702s residual 0.018s (73% prefill, 3714 toks), `padi` 4.275s/5.966s (40%), `Long` 7.747s/5.446s (57%) **measured**, residual <0.03s **measured**; LongContext confirms prefill-driven.
+- **PF2-4 TTL cache (skipped)** — `queries.jsonl` 597 entries 77% repeat but `cross_user_hits 0` same_user 54 **measured** (all `1000472020` 219/236) **measured**, 5 req/hour **measured**, 0 cross-user repeat → skip, debt avoided **code-derived**.
+- **Part0 busy signal** — `core/sugi_core.py:460` `data/busy/<user>_<ns>.flag` per-request (`_busy_mark`/`_busy_unmark` `time.time_ns`+`threading.get_ident`), `services/insight_common.py:6` `is_chatbot_busy()`/`wait_if_busy()` 5s poll up to 60s defer (stale 300s auto-clean) **code-derived**; `daily_insight.py:46`/`government_insight_service.py:40`/`farmer_insight_service.py:41` `wait_if_busy` before batches **measured** 4s wait **measured**.
+- **Part1 duplicate fix** — `core/query_logger.py:59` `hex[:12]` (was 8) + `92` idempotent `commit_trace` (`_committed` guard, second suppressed) **code-derived**; 20 dups 9ms vs 3.2M ms **measured** `pop("_start_ts",0)` → monotonic **code-derived**, now 0 new dups **measured**, query_id len 12 **measured**.
+- **Part2 TTFT re-verification** — same as PF2-2 but cross-ref Part0: cold 15.247s TTFT 24.470s vs warm 0.025s TTFT 1.329s **measured** (3 runs) — same root as Part0, not separate bug, no streaming fix needed **measured**.
+- **Part3 magnitude clarification** — clean before/after miss `xyzabc` **measured** 2.795s old vs 1.528s new (1.266s total) as above, pooled sequential 1.594s **measured**.
+- **Part4 prompt trim** — `core/sugi_core.py:662` `all_docs[:6]` (was 8) **code-derived** (3680 vs 3714 -1% **measured**, 0/25 flagged both caps **measured**); warm simple prefill 0.309s vs cold 15s, padi 6.39s, Long 9.19s **measured** after trim, flag 1/5 vs 1/4 no regression **measured**.
+- **P4-1 outlier confirmation** — `p41_check.py` 0/12 since Part0 vs 8/493 **measured**, 0 dups **measured**, huge 0 **measured** — outliers dropped 100% in window (small N, synthetic overlap test as backup).
+- **P4-2 ceiling** — verified `wait_if_busy` proceeds after 60s **measured** `6.0s` with held 10s flag **measured**, not skip — bounded residual contention, extend to 120s if P4-6 shows contention.
+- **P4-3 doc cap re-validation** — matched 25 queries 0/25 flagged both caps **measured** (lexical fake) and real 5 queries 1/5 **measured** — keep 6.
+- **P4-4 QW-3 + QW-5** — `core/sugi_core.py:402` background reranker 4.19s overlapped (was serial) **measured**, `core/sugi_core.py:474` `model.invoke("Halo")` warm-up background **measured** (first real after warm-up 21.20s cold vs 2-3s warm race).
+- **P4-5 Chroma fallback** — `core/sugi_core.py:610` `try: embed_query` except BM25-only + `degraded_mode` disclaimer **code-derived**; simulated `failing_embed` → BM25 len>0 **measured**.
+- **P4-6 combined load** — `p46_test.py` 5 concurrent + fake insight 3× qwen **measured** median 32.24s p95 49.81s max 49.81s **measured** (free RAM 0.51-0.95GB **measured**, VRAM resident **measured**) well below 94-365s — busy holds.
+- **Performance retest 2026-09-09** — `tests/review/test_ai_performance.py` 17/17 PASS 262.92s **measured** (was 294.47s) vs 2026-09-07: Greeting 9.70s (was 9.79s), Simple 11.15s (was 12.11s), Plant 13.65s (was 13.58s), Weather 13.15s (was 8.57s), Price 7.25s (was 9.77s), Complex 12.96s, MultiTurn 10.66s (was 13.94s), Long 16.89s (was 17.60s); SimpleFactual median 3.47s (was 6.36s), Plant median 3.34s (was 4.20s); embedding 0.031s **measured** (was 2.06s), LLM short 2.94s long 4.40s **measured**, rerank 0.055s **measured**, log-derived all median 16.28s p95 47.90s **measured** (was 16.86/48.38), recent 13.02s p95 35.75s **measured** (was 18.17/94.21).
+
+### Files affected
+`core/sugi_core.py`, `core/query_logger.py`, `core/plant_api.py`, `services/insight_common.py`, `services/daily_insight.py`, `services/government_insight_service.py`, `services/farmer_insight_service.py`, `tests/review/test_ai_performance.py`, `docs/decisions.md`, `docs/PHASE1_REVIEW_RERUN_20260907.md`, `docs/CHANGELOG.md`, `README.md`, `docs/VERSIONS.md`.
+
+---
+
 ## `v0.3.0` — 2026-09-07 — Scalability remediation complete (Phases 1-5: Tier 1, V1b/V2b, P2-2..P2-4, G1/G2, H1/H2/H3, I1) + performance retest [inferred]
 
 **Status:** working-tree changes (uncommitted; 4-phase scalability review + I1 instrumentation, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 294.47s, `docs/decisions.md` Phase 5, `start_all.py` dual Ollama, ThreadingHTTPServer backlog 50).
@@ -604,6 +639,8 @@ Modelfile, document ingestion and question generation.
 ## Git history index (commit → version, reconstructed)
 
 ```
+2026-09-09  (uncommitted working tree)              → v0.4.0
+2026-09-07  (uncommitted working tree)              → v0.3.0
 2026-08-12  (uncommitted working tree)              → v0.2.1
 2026-08-12  f53db8e                       → v0.2.0
 2026-07-13  cd6f42b / 6fb410c / cc94e4c  → v0.1.9

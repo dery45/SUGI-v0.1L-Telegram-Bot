@@ -37,7 +37,7 @@ from dotenv import load_dotenv
 if Path(__file__).resolve().parent.parent not in map(Path, sys.path):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.insight_common import build_insight_llm, get_rag_context, get_weather_context, ping_with_retry
+from services.insight_common import build_insight_llm, get_rag_context, get_weather_context, ping_with_retry, wait_if_busy
 
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
@@ -297,6 +297,8 @@ class GovernmentInsightEngine:
         print(f"{'=' * 60}")
 
         for i, col_name in enumerate(SOURCE_COLLECTIONS):
+            # Part0: defer batch if chatbot busy
+            wait_if_busy("gov", max_wait=60)
             try:
                 if force_all:
                     self._process_collection(col_name)

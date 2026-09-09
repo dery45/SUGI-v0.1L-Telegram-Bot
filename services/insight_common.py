@@ -1,6 +1,45 @@
 import time
+import os
+from pathlib import Path
+from datetime import datetime
 from pymongo import MongoClient
 from pymongo.errors import ServerSelectionTimeoutError
+
+# Part0: chatbot busy signal (file per request, inter-process)
+_BUSY_DIR = Path(__file__).resolve().parent.parent / "data" / "busy"
+_BUSY_STALE_SECS = 300  # 5 min: treat stale flag as not busy (crash safety)
+
+def is_chatbot_busy() -> bool:
+    """Check if chatbot is actively handling a request (any recent busy flag)."""
+    try:
+        if not _BUSY_DIR.exists():
+            return False
+        now = time.time()
+        for p in _BUSY_DIR.iterdir():
+            try:
+                # stale check: mtime older than 5 min → ignore and clean
+                if now - p.stat().st_mtime > _BUSY_STALE_SECS:
+                    try:
+                        p.unlink()
+                    except Exception:
+                        pass
+                    continue
+                return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+def wait_if_busy(label: str = "insight", max_wait: int = 60, poll: int = 5) -> None:
+    """Part0: defer LLM batch if chatbot busy, polling up to max_wait."""
+    waited = 0
+    while is_chatbot_busy() and waited < max_wait:
+        print(f"  [{label}] chatbot busy — deferring {poll}s (waited {waited}s)")
+        time.sleep(poll)
+        waited += poll
+    if is_chatbot_busy():
+        print(f"  [{label}] still busy after {max_wait}s — proceeding anyway (stale?)")
 
 
 def ping_with_retry(mongo: MongoClient, label: str, attempts: int = 3, base_wait: float = 5.0) -> None:

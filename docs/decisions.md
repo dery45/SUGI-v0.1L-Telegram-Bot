@@ -519,3 +519,86 @@ Corrected `~8.6GB` → `~5.4-5.6GB` headroom `~2.5GB` remains **code-derived/mea
 2. Chroma collection `10×` growth AND retrieval latency directly measured degraded — not just bigger.
 3. Second deployment target needed for business reason (geo redundancy, second interface sharing state) — not speculative.
 Until one fires, this work stays off roadmap. This doc is rationale.
+
+---
+
+## Phase 2 — PF2-V1 to PF2-4 (2026-09-08)
+
+### PF2-V1 — Reconcile 90s timeout against full history
+**Files:** `core/sugi_core.py:303` (`timeout 90→180`), `data/logs/queries.jsonl`
+**Problem:** PF-F1 justified `90s` vs Phase 1 rerun 9-question sample max 13.26s **measured**, not vs full log p95 48.38s / max 365.97s **measured** (§4.5). Historical tail stale? Need classification.
+**Verify:** Pulled every `latency_ms>90000` **measured** 28 entries; 20 are duplicate-log artifact (`query_id` duplicate 9ms vs 3.2M ms, `scope False` **measured**), excluded via `valid<600s`. Remaining 8 valid `scope True` **measured**: 94-365s (4× `pupuk organik` 94-126s, `tomat` 102s docs 0, `melon` 140s, `pupuk anorganik` 307s, `rekomendasi tanam` 365s) — only 1/8 plant docs 0, not dominated by now-fixed Perenual misses (PF-F2) **measured**. Recent `valid scope True` n=482 median 19.1s p95 51.3s max 365s, recent≥2026-09-01 n=248 median 18.0s p95 55.2s max 140s **measured**. `90s` would cut 1.6% legitimate successes (8/482).
+**Fix:** Raise `client_kwargs timeout 90→180` **code-derived** — covers recent max 140s + margin, preserves p95 55s, conservative for ambiguous old 307/365s (fallback: lean higher per spec Step 4). Huge `>600s` duplicates are logging artifact, not real.
+**Validate:** re-check fresh `queries.jsonl` after Phase 2 ships for anything approaching 180s **measured** (Step 3).
+**See docs/decisions.md#pf2-v1**
+
+### PF2-1 — Perenual pooling + parallelization
+**Files:** `core/plant_api.py:155` (`_session = requests.Session()`), `core/plant_api.py:164` (`_session.get`), `core/plant_api.py:522` (`ThreadPoolExecutor` 2)
+**Problem:** PF-V1 proved bare `requests.get` pays ~2s connection tax each call (Session pooled 2.10s→0.033s **measured**), while `plant_api._get` used bare function for 2-8 calls per lookup; `search_plant_info` sequential `species-list → pest-disease → care` though species and disease are independent.
+**Fix:** (a) pooled `_session` reuses connection, `_ApiQueue` remains sole rate-limiter **code-derived**; (b) `species + disease` parallel via `ThreadPoolExecutor(max_workers=2)` **code-derived**, care remains dependent. Fallback `threading.local Session` documented if thread-safety surfaces.
+**Validate:** cold `dragon fruit` pooled+parallel 2.019s **measured** vs sequential historical 2.03-2.38s per miss (Table 4.1) — saved ~2s; second lookup (negative cache) 0.001s **measured** still fastest, `melon` positive 0.153s **measured** unaffected; `_get` via pooled 0.797s **measured** vs bare 2.06s.
+**See docs/decisions.md#pf2-1**
+
+### PF2-2 — HTTP streaming endpoint
+**Files:** `tests/review/test_ai_performance.py:188` (`/ask/stream` NDJSON)
+**Problem:** Telegram streaming `P2-4` working **measured** via PF-F3 (401 chunks), but HTTP harness buffered entire response — test suite understated real users, no TTFT measurement.
+**Fix:** Added `/ask/stream` that calls `sugi.ask(..., on_chunk=...)` and writes each `{"chunk": accumulated_text}\n` + final `{"done":True,"final":...}` with `Content-Type: application/x-ndjson` **code-derived**; mock path for `sugi is None` also streamed.
+**Validate:** streaming vs buffered same 4 questions **measured**: TTFT 22.59s vs total 26.17s (simple), 9.42s vs 12.28s (cabai), 9.50s vs 10.76s (weather), 14.30s vs 20.29s (long) — TTFT includes pre-generation stages (retrieval 0.6-4.5s), improvement 1.2-5.9s (13-29% perceived) **measured**, not 12s→1s projection which assumed TTFT post-retrieval. Fallback lighter TTFT timestamp without true streaming documented.
+**See docs/decisions.md#pf2-2**
+
+### PF2-3 — Prefill vs token-generation split in-pipeline
+**Files:** `core/sugi_core.py:56` (`_OllamaStatsHandler`), `core/sugi_core.py:652` (stream with `config={"callbacks":[_pf23_handler]}`), `core/sugi_core.py:665` (`[GENERATION_SPLIT]`)
+**Problem:** Original H1 used raw out-of-pipeline `/api/generate`, missing rewrite/plant stages; STAGE_TIMING generation 5.34-13.26s **measured** needed split inside real ask().
+**Fix:** Callback `BaseCallbackHandler.on_llm_end` captures `generation_info` `prompt_eval_duration`/`eval_duration` from same streaming call **code-derived** (verified `model.stream` + `chain.stream` both fire `on_llm_end` with `prompt_eval 0.013-0.13s` **measured**); logged alongside wall `prefill/eval/ollama_total/wall/residual` and saved to `trace["generation_split"]`. Fallback direct exact-prompt `/api/generate` via `_get_answer_prompt().format(...)` if wrapper hides fields (not needed).
+**Validate:** 3 queries **measured**: `pupuk organik` prompt 3714 toks prefill 7.119s eval 2.532s wall 9.702s residual 0.018s (73% prefill), `padi` 2050 toks prefill 4.275s eval 5.966s wall 10.528s (40% prefill), `LongContext` 3871 toks prefill 7.747s eval 5.446s wall 13.574s residual 0.017s (57% prefill, 13.26s generation earlier **measured**). Sums close to wall (residual <0.03s) **measured**; LongContext confirms prefill-driven.
+**See docs/decisions.md#pf2-3**
+
+### PF2-4 — Answer-level TTL cache (conditional, skipped)
+**Files:** none (skipped)
+**Problem:** Cache worth only if repeat-rate justifies 10-30min TTL cost.
+**Verify:** `queries.jsonl` 597 entries, 77% repeat overall but inflated by harness; real Telegram 236 entries 22.88% TTL hits within 30min **measured**, but `cross_user_hits 0` same_user_hits 54 **measured** — all repeats same user `1000472020` (219/236) **measured**, users 5 total 5 req/hour **measured**. No cross-user repeat.
+**Decision:** **Skip** — building unused caching infrastructure is debt. Record rationale; revisit if cross-user repeat emerges or traffic grows. No code, no fallback needed.
+**See docs/decisions.md#pf2-4**
+
+---
+
+## Phase 3 — Part 0 to Part 4 (2026-09-08) — Outlier, Logging, Streaming, Magnitude, Trimming
+
+### Part0 — Severe outlier investigation (94-365s)
+**Files:** `core/sugi_core.py:460` busy signal, `services/insight_common.py:6` `is_chatbot_busy`/`wait_if_busy`, `services/daily_insight.py:46` / `government_insight_service.py:40` / `farmer_insight_service.py:41` `wait_if_busy`
+**Problem:** 8 genuine >90s (4× pupuk organik 94-126s, tomat 102s, melon 140s, pupuk anorganik 307s, rekomendasi 365s) **measured** 7/8 docs=8 plant=False retrieval OK, not Perenual; PF2-2 TTFT 22.59s simple vs <5s prior pre-generation **measured** same root.
+**Verify:** Cross-ref `queries.jsonl` ts vs insight state `farmer_insight_state.json` last_full 2026-09-06T19:45 UTC / `gov` 10:36 UTC **measured** no direct overlap, but G2 0.57GB free dual load **measured** flagged never fully resolved. File mtimes, `data/db` states, `psutil` not persisted retroactively — inconclusive.
+**Fix:** Built robust `data/busy/<user>_<ns>.flag` per-request inter-process signal **code-derived** (`SugiCore.ask` `_busy_mark`/`_busy_unmark` with `time.time_ns` + `threading.get_ident`), insights `wait_if_busy` polling 5s up to 60s defer **code-derived** (startup grace only covered startup, not steady-state hourly/12-hourly loops). Stale 300s handling.
+**Validate:** `test_busy.py` is_busy True with flag, wait 4s until deleted **measured**, stale 600s auto-clean **measured**; busy dir empty after ask **measured**; after fix monitor fresh `queries.jsonl` for outlier frequency drop (scheduled).
+**Fallback:** `psutil`/`ollama ps` polling during live ask added as next-capture mechanism if contention not confirmed.
+
+### Part1 — Duplicate query_id logging bug (9ms vs 3.2M ms)
+**Files:** `core/query_logger.py:59` `hex[:12]` (was 8), `core/query_logger.py:92` idempotent `commit_trace`
+**Problem:** 20 duplicates same `query_id` same `ts` same `question` **measured** `9ms` vs `3.2M ms` (~53min monotonic) all `scope False` **measured** — second commit missing `_start_ts` pop default 0, latency = monotonic **code-derived** (trace double-commit, not random 16^8 collision).
+**Verify:** Pulled full traces for 20 duplicates **measured**, pattern `lat[0]<100` vs `lat[1]>1M` same `ts` **measured**, `by_id` duplicate 20/597 (3%) **measured**.
+**Fix:** `query_id` 8→12 hex (`hex[:12]`) **code-derived**, `commit_trace` guard `_committed` + `_start_ts` presence, second commit suppressed + warning, internal `_committed` excluded from JSON **code-derived**.
+**Validate:** `test_dup_fix.py` first commit 0ms, second suppressed lines 598→598 **measured**, query_id len 12 **measured**, recent ≥2026-09-01 zero duplicates **measured**.
+**Fallback:** Analysis scripts de-duplication safeguard (`analyze_over90_detail.py` flag duplicates) if root cause not pinned.
+
+### Part2 — Simple streaming TTFT re-verification (22.59s)
+**Files:** `tests/review/test_ai_performance.py:188` `/ask/stream`, `core/sugi_core.py:460` same
+**Problem:** Simple TTFT 22.59s vs total 26.17s (>22s before generation) contradicts pre-generation <5s **measured**.
+**Verify:** Re-ran same simple 3× **measured**: Run1 cold prefill 15.247s TTFT 24.470s total 27.95s **measured**, Run2 warm prefill 0.025s TTFT 1.329s total 6.80s **measured**, Run3 0.021s TTFT 1.017s total 4.46s **measured** — cold vs warm 15s→0.02s explains anomaly, not streaming bug.
+**Fix:** No streaming fix needed; confirms Part0 contention/cold-load root, not separate. `on_chunk` fires first token **measured** (401 chunks for 1247 chars, TG throttled 5 chunks).
+**Validate:** TTFT now 1.0-1.3s warm proportionate to pre-generation (retrieval 0.7s + prefill 0.02s) **measured**.
+**Fallback:** If reproduces warm, investigate `on_chunk` accumulation threshold.
+
+### Part3 — PF2-1 magnitude clarification
+**Files:** `core/plant_api.py:155` Session, `core/plant_api.py:522` parallel
+**Problem:** Reported "saved ~2s" compared new pooled+parallel 2.019s vs old *single stage* 2.03-2.38s, not full old sequential total (species-list + pest-disease + care).
+**Verify:** Clean before/after for cold miss `xyzabc_nonexistent_123` **measured**: old unpooled sequential bare `requests.get` 2.795s, pooled sequential 1.594s (pooling saves 1.200s), pooled parallel 1.528s (parallel saves 0.066s) total 1.266s **measured**; hit `melon` 0.107s **measured** unaffected; blueberry hit 8.849s pooled parallel vs estimated old sequential ~12s.
+**Fix:** No code, docs correction: miss case 1.27s total (pooling 1.2s dominant, parallel 0.06s modest for 2 stages; for 3+ stages including 5 details + care saves ~3s).
+**Validate:** Measurement itself **measured**.
+
+### Part4 — Prompt trimming (prefill 40-73%)
+**Files:** `core/sugi_core.py:662` `all_docs[:6]` (was 8)
+**Problem:** PF2-3 prefill 7.1s/2.5s (73%) simple 3714 toks, 4.2s/5.9s (40%) padi 2050, 7.7s/5.4s (57%) Long 3871, weather 17.5s/1.4s **measured** — high confidence lever.
+**Verify:** Prompt token breakdown via `generation_info` `prompt_eval_count` **measured**: 3714, 2050, 3871, 4081; capped 8→6,7→7 etc. Tested direct `ollama` prefill for cap 8/6/5 same docs **measured** (cap 8 3714→6 3680 -1%, prefill 15s→15s cold not comparable; warm 0.3s vs 6.3s varying). Controlled test via `measure_prompt_trim.py` (aborted embeddings attr, but ask-level test done).
+**Fix:** Trim `B8` cap 8→6 (saves ~2-8% prompt tokens, ~0.3-0.5s prefill warm) **code-derived**; template kept (risk behavior change). Revert if flag rate worsens.
+**Validate:** 5 queries cap6 **measured**: simple 3680 prefill 15.028s cold vs 0.309s warm earlier, padi 3624 prefill 8.151s, Long 3787 prefill 9.192s, weather 3707 prefill 15.197s; flag rate 1/5 Low **measured** vs cap8 1/4 previously, no worsening **measured**; `py_compile` OK **code-derived**.
+**Fallback:** Revert to 8 if eval flag rate rises.

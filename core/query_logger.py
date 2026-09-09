@@ -56,7 +56,7 @@ def new_query_trace(session_id: str) -> dict:
     return {
         "ts":              datetime.now().isoformat(),
         "session_id":      session_id,
-        "query_id":        str(uuid.uuid4())[:8],
+        "query_id":        uuid.uuid4().hex[:12],  # Part1: 12 hex (was 8) reduces collision 16^8→16^12
         "question":        "",
         "rewritten":       "",
         "scope_passed":    None,
@@ -69,6 +69,7 @@ def new_query_trace(session_id: str) -> dict:
         "model_name":      _model,
         "prompt_version":  PROMPT_VERSION,
         "_start_ts":       time.monotonic(),   # internal, tidak disimpan
+        "_committed":      False,  # Part1: guard against double commit
     }
 
 
@@ -91,19 +92,30 @@ def set_docs(trace: dict, docs: list) -> None:
 def commit_trace(trace: dict, error: Optional[str] = None) -> None:
     """
     Finalisasi dan tulis trace ke JSONL. Hapus field internal.
+    Part1: idempotent — second commit on same dict is no-op (prevents 9ms vs 3.2M ms duplicate).
     """
     _ensure_log_dir()
-    trace["latency_ms"] = int((time.monotonic() - trace.pop("_start_ts", 0)) * 1000)
+    # Part1: guard double commit (stale reference or query_id collision via truncation)
+    if trace.get("_committed"):
+        print(f"⚠️  commit_trace double-commit suppressed for {trace.get('query_id')}")
+        return
+    if "_start_ts" not in trace:
+        print(f"⚠️  commit_trace missing _start_ts for {trace.get('query_id')} — suppressed")
+        return
+    trace["latency_ms"] = int((time.monotonic() - trace.pop("_start_ts")) * 1000)
+    trace["_committed"] = True
     trace["error"]      = error
 
+    # Part1: exclude internal fields from persisted JSON
+    to_write = {k: v for k, v in trace.items() if not k.startswith("_")}
     # Tulis ke queries.jsonl
     with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+        f.write(json.dumps(to_write, ensure_ascii=False) + "\n")
 
     # Kalau ada flag dari eval, tulis juga ke eval_flags.jsonl
     if trace.get("eval", {}).get("flag"):
         with open(EVAL_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(trace, ensure_ascii=False) + "\n")
+            f.write(json.dumps(to_write, ensure_ascii=False) + "\n")
 
     _print_trace_summary(trace)
 

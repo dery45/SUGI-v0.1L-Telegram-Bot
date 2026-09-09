@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 if Path(__file__).resolve().parent.parent not in map(Path, sys.path):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.insight_common import build_insight_llm, get_plant_context, get_rag_context, get_weather_context, ping_with_retry
+from services.insight_common import build_insight_llm, get_plant_context, get_rag_context, get_weather_context, ping_with_retry, wait_if_busy
 
 _ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(_ROOT / "config" / ".env")
@@ -1126,6 +1126,7 @@ class FarmerInsightEngine:
     def run_all(self):
         print("\n  ── Generating all farmer insights (10) ──")
         for i, defn in enumerate(FARMER_INSIGHT_DEFS):
+            wait_if_busy("farmer", max_wait=60)
             try:
                 result = self._generate_farmer_insight(defn)
                 if result:
