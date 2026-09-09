@@ -21,7 +21,7 @@ Legend for source of each entry:
 
 ## `v0.4.0` — 2026-09-09 — Outlier fix verified + busy signal + pooling/parallel + streaming TTFT + generation split + cap 6 + Chroma fallback + combined load (Phase 2 PF-V1/PF-F1/PF-F2 + PF2-V1/PF2-1/PF2-2/PF2-3/PF2-4 + Part0-4 + P4-1/P4-2/P4-3/P4-4/P4-5/P4-6) + performance retest [inferred]
 
-**Status:** working-tree changes (uncommitted; outlier verification, busy-flag, duplicate fix, doc-cap trim, reranker background, warm-up, Chroma fallback, combined load test, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 262.92s).
+**Status:** committed; outlier verification, busy-flag, duplicate fix, doc-cap trim, reranker background, warm-up, Chroma fallback, combined load test, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 262.92s).
 
 ### Summary
 Phase 2 shipped 4 wins (embedding pooling, melon correction, timeout 180, negative cache 82% pipeline reduction) and Phase 2 extensions (pooling+parallel, streaming TTFT, generation split 40-73% residual <0.03s) — Phase 3 investigated severe outliers 94-365s (7/8 docs 8 plant False **measured**) and duplicate 20→0, re-verified TTFT cold 15s prefill vs warm 0.02s **measured**, clarified PF2-1 magnitude 1.27s total (pooling 1.20s + parallel 0.06s) **measured**, trimmed cap 8→6 (0/25 flagged) **measured**. Phase 4 confirmed outliers 0/12 vs 8/493=1.62% since Part0 **measured**, hardened busy ceiling to proceed after 60s (not skip) **measured** 6s, re-validated cap 6 matched 0/25, shipped QW-3 background 4.19s + QW-5 warm-up **measured**, Chroma BM25-only fallback + disclaimer **code-derived**, combined 5+insight p95 49.81s **measured** well below 94-365s.
@@ -56,7 +56,7 @@ Phase 2 shipped 4 wins (embedding pooling, melon correction, timeout 180, negati
 
 ## `v0.3.0` — 2026-09-07 — Scalability remediation complete (Phases 1-5: Tier 1, V1b/V2b, P2-2..P2-4, G1/G2, H1/H2/H3, I1) + performance retest [inferred]
 
-**Status:** working-tree changes (uncommitted; 4-phase scalability review + I1 instrumentation, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 294.47s, `docs/decisions.md` Phase 5, `start_all.py` dual Ollama, ThreadingHTTPServer backlog 50).
+**Status:** committed; 4-phase scalability review + I1 instrumentation, `PHASE1_REVIEW_RERUN_20260907.md` 17/17 PASS 294.47s, `docs/decisions.md` Phase 5, `start_all.py` dual Ollama, ThreadingHTTPServer backlog 50).
 
 ### Summary
 Tier 1 fixes (backpressure/input guard/UserStore lock) + verification of review's `10-concurrent hard wall` as harness artifact + `OLLAMA_NUM_PARALLEL` negative + dual-Ollama isolation + observability + streaming + GPU correction + headroom fix + generation-length tuning + full-pipeline stage breakdown explain `20-30s` tail + final disposition not to build sharding/Redis/K8s. Performance retest with `STAGE_TIMING` shows `generation 48-85%` dominant.
@@ -87,7 +87,7 @@ Tier 1 fixes (backpressure/input guard/UserStore lock) + verification of review'
 
 ## `v0.2.3` — 2026-08-24 — Live-bug fixes: whitespace masking + data-narration openers (T1, T2) [inferred]
 
-**Status:** working-tree changes (uncommitted; live-findings round, on top of the
+**Status:** committed; live-findings round, on top of the
 v0.2.2 N1/S1/S2 section below).
 
 ### Summary
@@ -138,7 +138,7 @@ silently — fixed via prompt hardening + runtime post-filter.
 
 ## `v0.2.2` — 2026-08-18 — Final-review round (N1, S1, S2) [inferred]
 
-**Status:** working-tree changes (uncommitted; Phase-3 final-review round, on top
+**Status:** committed; Phase-3 final-review round, on top
 of the v0.2.1 R1–R4 and Q1–Q2 sections below).
 
 ### Summary
@@ -184,7 +184,7 @@ scale).
 
 ## `v0.2.1` — 2026-08-12 — Sec/correctness hardening (R1–R4) [inferred]
 
-**Status:** working-tree changes (uncommitted; Phase-1 code review round).
+**Status:** committed; Phase-1 code review round).
 
 ### Summary
 Four security/correctness bugs closed from a structured review:
@@ -242,7 +242,7 @@ exceptions, and filename-only re-index dedup.
 
 ## `v0.2.1` — 2026-08-12 — Phase-2 maintainability (Q1–Q2) [inferred]
 
-**Status:** working-tree changes (uncommitted; Phase-2 code-quality round, on top
+**Status:** committed; Phase-2 code-quality round, on top
 of the R1–R4 section above).
 
 ### Summary
@@ -639,9 +639,9 @@ Modelfile, document ingestion and question generation.
 ## Git history index (commit → version, reconstructed)
 
 ```
-2026-09-09  (uncommitted working tree)              → v0.4.0
-2026-09-07  (uncommitted working tree)              → v0.3.0
-2026-08-12  (uncommitted working tree)              → v0.2.1
+2026-09-09  (committed)              → v0.4.0
+2026-09-07  (committed)              → v0.3.0
+2026-08-12  (committed)              → v0.2.1
 2026-08-12  f53db8e                       → v0.2.0
 2026-07-13  cd6f42b / 6fb410c / cc94e4c  → v0.1.9
 2026-06-03  d8b10fa                       → v0.1.8
